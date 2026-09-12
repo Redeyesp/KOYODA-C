@@ -18,6 +18,7 @@
 #include "esp_random.h"
 #include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
@@ -56,11 +57,22 @@ static const char *TAG = "KOYODA_BACKEND";
 #define KOYODA_AUDIO_SAMPLE_RATE 22050
 #define KOYODA_AUDIO_FRAME_MS    12
 
-#define BACKEND_MIC_QUEUE_DEPTH   16
-#define BACKEND_MIC_SAMPLES_MAX   512
+#define BACKEND_MIC_QUEUE_DEPTH   8
+#define BACKEND_MIC_SAMPLES_MAX   256
 #define BACKEND_TICK_MS           500
 #define BACKEND_OTA_RETRY_MS      (30U * 1000U)
 #define BACKEND_WS_HELLO_TIMEOUT_MS 10000
+
+/*
+ * KOYODA owns the display from app_main, which runs at priority 1 pinned
+ * to CPU0. This task MUST stay below/off that path or the face animation
+ * visibly stutters:
+ *   - priority 2 matches the audio owner and the old stream module,
+ *   - CPU1 keeps LVGL flushes on CPU0 uncontended.
+ */
+#define BACKEND_TASK_PRIORITY     2
+#define BACKEND_TASK_CORE         1
+#define BACKEND_TASK_STACK_BYTES  6144
 
 typedef struct
 {
@@ -89,6 +101,8 @@ static char s_ws_url[192] = {0};
 static char s_ws_token[128] = {0};
 
 static QueueHandle_t s_mic_queue = NULL;
+static uint8_t *s_mic_queue_storage = NULL;
+static StaticQueue_t s_mic_queue_struct;
 static TaskHandle_t s_task = NULL;
 static esp_websocket_client_handle_t s_ws = NULL;
 static EventGroupHandle_t s_events = NULL;
@@ -680,7 +694,33 @@ esp_err_t koyoda_backend_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    s_mic_queue = xQueueCreate(BACKEND_MIC_QUEUE_DEPTH, sizeof(mic_frame_msg_t));
+    /*
+     * Put the mic buffer in PSRAM. Created with plain xQueueCreate it
+     * lands in internal RAM, which on this board is the same pool the
+     * LCD needs for DMA-capable flush buffers -- that starvation shows
+     * up as torn lines and a stuttering face on page changes.
+     * Only the control block stays internal; it is ~80 bytes and this
+     * queue is never touched from an ISR.
+     */
+    s_mic_queue_storage = heap_caps_malloc(
+        BACKEND_MIC_QUEUE_DEPTH * sizeof(mic_frame_msg_t),
+        MALLOC_CAP_SPIRAM);
+
+    if (s_mic_queue_storage != NULL)
+    {
+        s_mic_queue = xQueueCreateStatic(
+            BACKEND_MIC_QUEUE_DEPTH,
+            sizeof(mic_frame_msg_t),
+            s_mic_queue_storage,
+            &s_mic_queue_struct);
+    }
+    else
+    {
+        /* No PSRAM available: fall back rather than refusing to start. */
+        ESP_LOGW(TAG, "PSRAM unavailable; mic queue falls back to internal RAM");
+        s_mic_queue = xQueueCreate(BACKEND_MIC_QUEUE_DEPTH, sizeof(mic_frame_msg_t));
+    }
+
     if (s_mic_queue == NULL)
     {
         return ESP_ERR_NO_MEM;
@@ -688,8 +728,14 @@ esp_err_t koyoda_backend_start(void)
 
     koyoda_audio_duplex_set_frame_callback(mic_frame_callback, NULL);
 
-    BaseType_t ok = xTaskCreate(
-        backend_task, "koyoda_backend", 6144, NULL, 4, &s_task);
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        backend_task,
+        "koyoda_backend",
+        BACKEND_TASK_STACK_BYTES,
+        NULL,
+        BACKEND_TASK_PRIORITY,
+        &s_task,
+        BACKEND_TASK_CORE);
     if (ok != pdPASS)
     {
         return ESP_FAIL;
