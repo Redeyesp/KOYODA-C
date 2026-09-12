@@ -1,0 +1,39 @@
+menu "KOYODA Audio Streaming (legacy, unused)"
+
+    comment "koyoda_audio_stream.c is no longer built; see KOYODA Xiaozhi Backend below"
+
+config KOYODA_STREAM_HOST
+    string "PCM receiver host/IP"
+    default "192.168.1.36"
+
+config KOYODA_STREAM_PORT
+    int "PCM receiver TCP port"
+    range 1 65535
+    default 7777
+
+endmenu
+
+menu "KOYODA Xiaozhi Backend"
+
+config KOYODA_OTA_URL
+    string "OTA check-in URL"
+    default "https://api.tenclass.net/xiaozhi/ota/"
+    help
+        HTTPS endpoint KOYODA POSTs a small device-info JSON to on every
+        reconnect attempt. The response's "websocket" section tells
+        KOYODA which server + token to open the audio channel with,
+        matching xiaozhi-esp32's own OTA check-in.
+
+        Point this at your own self-hosted xiaozhi-esp32-server (or a
+        compatible test harness) rather than a public endpoint unless
+        you know what you're doing.
+
+config KOYODA_BOARD_NAME
+    string "Board identifier sent to the server"
+    default "koyoda-esp32s3-amoled-1.75"
+    help
+        Sent in the OTA check-in body as "board". Purely informational;
+        change it if you want your server-side logs/dashboard to show a
+        friendlier name for this KOYODA unit.
+
+endmenu
