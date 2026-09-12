@@ -260,6 +260,11 @@ jobs:
           for name in ("flash_args", "flasher_args.json"):
               shutil.copy2(build / name, out / name)
 
+          # Ship the ELF so a Guru Meditation backtrace can be decoded to
+          # real function names later. Without it a crash dump is just hex.
+          for elf in build.glob("*.elf"):
+              shutil.copy2(elf, out / elf.name)
+
           for name in (
               "sdkconfig",
               "dependencies.lock",

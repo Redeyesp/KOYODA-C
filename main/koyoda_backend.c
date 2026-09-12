@@ -87,7 +87,9 @@ static const char *TAG = "KOYODA_BACKEND";
  */
 #define BACKEND_TASK_PRIORITY     2
 #define BACKEND_TASK_CORE         1
-#define BACKEND_TASK_STACK_BYTES  6144
+/* The OTA check-in performs a full HTTPS request on this task, and
+ * mbedtls needs several KB of stack for the handshake alone. */
+#define BACKEND_TASK_STACK_BYTES  10240
 
 typedef struct
 {
@@ -819,6 +821,15 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
          * data->payload_len vs data->data_len); a production build should
          * reassemble those before treating data_ptr as a whole message.
          */
+        if (data->data_ptr == NULL || data->data_len <= 0)
+        {
+            /* Control frames (ping/pong/close) and empty continuations
+             * arrive here too; nothing to parse. */
+            break;
+        }
+
+        ESP_LOGD(TAG, "ws frame op=%d len=%d", data->op_code, data->data_len);
+
         if (data->op_code == 0x1 /* text */)
         {
             handle_incoming_json(data->data_ptr, data->data_len);
@@ -869,9 +880,19 @@ static esp_err_t open_ws_channel(void)
 
     esp_websocket_client_config_t cfg = {
         .uri = s_ws_url,
-        .reconnect_timeout_ms = 0, /* the backend task owns retry/backoff */
+        /* Left at the library default on purpose: passing 0 only produces
+         * a warning and the backend task owns retry/backoff anyway. */
+        .reconnect_timeout_ms = 10000,
         .network_timeout_ms = 8000,
         .crt_bundle_attach = esp_crt_bundle_attach,
+        /*
+         * The websocket client runs TLS on its own task, and our event
+         * handler adds cJSON parsing and an Opus decode on top of that.
+         * The library default stack is not sized for this and overflowing
+         * it corrupts memory rather than failing cleanly.
+         */
+        .task_stack = 8192,
+        .buffer_size = 2048,
     };
     s_ws = esp_websocket_client_init(&cfg);
     if (s_ws == NULL)
