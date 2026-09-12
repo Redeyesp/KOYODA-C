@@ -56,32 +56,49 @@ Wi-Fi loss or a WebSocket error at any point closes the channel and
 returns the face to IDLE; it retries automatically (30 s backoff) as
 long as AI mode stays on and Wi-Fi comes back.
 
-## ⚠️ The one real gap: audio codec
+## Audio codec (Phase 2 — implemented)
 
-Stock xiaozhi-server / xiaozhi-esp32-server deployments expect
-**Opus-encoded audio at 16 kHz**. This foundation does **not** include an
-Opus codec yet — it sends/receives raw 16-bit PCM at KOYODA's native
-22050 Hz and honestly advertises `"format":"pcm"` in its hello message
-instead of lying about Opus.
+KOYODA now speaks real Opus, matching xiaozhi-esp32's parameters:
+**16000 Hz, mono, 60 ms frames** (`OPUS_FRAME_DURATION_MS 60`).
 
-That means: **out of the box, this will complete the OTA check-in and
-open the WebSocket, but an unmodified xiaozhi-server won't understand
-the audio you send it**, and audio it sends back (Opus) will just sound
-like noise if played as raw PCM.
+Because KOYODA's own audio path runs at 22050 Hz — which is *not* a legal
+Opus rate — `main/koyoda_codec.c` resamples in both directions:
 
-Two ways forward, both left as clearly marked TODOs in
-`koyoda_backend.c`:
+```
+mic:  22050 PCM --resample--> 16000 --accumulate 960--> Opus encode --> WS
+spk:  WS --> Opus decode --> 16000 --resample--> 22050 --> playback
+```
 
-1. **Add Opus** — pull in the `esp-opus` / `esp_audio_codec` managed
-   component (the same one xiaozhi-esp32 uses), and encode/decode at
-   the two marked spots: `KOYODA_TODO_OPUS_ENCODE` (mic → server) and
-   `KOYODA_TODO_OPUS_DECODE` (server → speaker). This is the "do it
-   properly" path and is what you'd want for any real deployment.
-2. **Patch your own server** — if you're running your own
-   xiaozhi-esp32-server fork for testing, add a PCM passthrough mode
-   that skips Opus decode/encode when it sees `"format":"pcm"`. Much
-   faster to get a first end-to-end voice round-trip working while you
-   build out the rest.
+Components used are the same ones xiaozhi-esp32 uses:
+`espressif/esp_audio_codec` (Opus) and `espressif/esp_audio_effects`
+(rate conversion).
+
+Two deliberate design points:
+
+- **All codec work runs on the backend worker task**, never the audio
+  owner task. The audio callback only posts to a queue and returns, so
+  the deterministic audio path is preserved.
+- **The codec is opened only when the audio channel opens** and released
+  the moment it closes. Opus state costs tens of KB; an idle KOYODA
+  (AI off) holds none of it. Buffers prefer PSRAM, because internal RAM
+  on this board is shared with the LCD's DMA pool.
+
+### Still not at full xiaozhi parity
+
+These are known gaps, not oversights:
+
+- **Protocol version is hard-coded to 1.** Real xiaozhi reads
+  `websocket.version` from the OTA response and supports v1/v2/v3, which
+  use *different binary framing* (v2 has a 16-byte header, v3 a 4-byte
+  one). KOYODA only implements v1 (bare payload, no header).
+- **OTA check-in is partial.** It sends `Device-Id`, `Client-Id` and
+  `Content-Type`, but not `Activation-Version`, `User-Agent`,
+  `Accept-Language` or `Serial-Number`. It parses only `websocket` and
+  `firmware` from the response, ignoring `activation`, `mqtt` and
+  `server_time` — so the xiaozhi Console activation flow will not work
+  yet.
+- **No wake word / AFE.** KOYODA uses its own VAD; there is no
+  `esp-sr` integration.
 
 ## Setup checklist
 

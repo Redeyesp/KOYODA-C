@@ -26,6 +26,7 @@
 #include "koyoda_wifi.h"
 #include "koyoda_audio_duplex.h"
 #include "koyoda_face_state.h"
+#include "koyoda_codec.h"
 
 static const char *TAG = "KOYODA_BACKEND";
 
@@ -126,6 +127,10 @@ static EventGroupHandle_t s_events = NULL;
 static volatile bool s_channel_open = false;
 static volatile bool s_playback_active = false;
 static volatile bool s_prev_vad = false;
+
+/* Scratch for decoded playback PCM. Only the websocket event task writes
+ * it, and only one decode is ever in flight. */
+static int16_t *s_playback_pcm = NULL;
 
 /* ------------------------------------------------------------------------- */
 /* Device identity: MAC string + a persistent random UUID, mirroring        */
@@ -341,12 +346,10 @@ static void send_hello(void)
     cJSON_AddItemToObject(root, "features", features);
     cJSON_AddStringToObject(root, "transport", "websocket");
     cJSON *audio = cJSON_CreateObject();
-    /* See the codec-gap note at the top of koyoda_backend.h: this is PCM,
-     * not Opus, until KOYODA_TODO_OPUS_ENCODE/_DECODE are implemented. */
-    cJSON_AddStringToObject(audio, "format", "pcm");
-    cJSON_AddNumberToObject(audio, "sample_rate", KOYODA_AUDIO_SAMPLE_RATE);
+    cJSON_AddStringToObject(audio, "format", "opus");
+    cJSON_AddNumberToObject(audio, "sample_rate", KOYODA_OPUS_SAMPLE_RATE);
     cJSON_AddNumberToObject(audio, "channels", 1);
-    cJSON_AddNumberToObject(audio, "frame_duration", KOYODA_AUDIO_FRAME_MS);
+    cJSON_AddNumberToObject(audio, "frame_duration", KOYODA_OPUS_FRAME_MS);
     cJSON_AddItemToObject(root, "audio_params", audio);
 
     char *json = cJSON_PrintUnformatted(root);
@@ -451,17 +454,20 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
         }
         else if (data->op_code == 0x2 /* binary */)
         {
-            /*
-             * KOYODA_TODO_OPUS_DECODE:
-             * data->data_ptr/data_len currently arrives as-is and is
-             * treated as raw PCM16LE mono. If the server actually sends
-             * Opus (the xiaozhi-esp32 default), decode it here first.
-             */
-            if (s_playback_active && data->data_len >= 2)
+            /* Protocol version 1: the payload is a bare Opus packet. */
+            if (s_playback_active && data->data_len > 0 && koyoda_codec_is_open())
             {
-                koyoda_audio_duplex_playback_write(
-                    (const int16_t *)data->data_ptr,
-                    (size_t)data->data_len / sizeof(int16_t));
+                size_t pcm_samples = 0;
+                if (koyoda_codec_decode(
+                        (const uint8_t *)data->data_ptr,
+                        (size_t)data->data_len,
+                        s_playback_pcm,
+                        KOYODA_CODEC_MAX_PCM_OUT,
+                        &pcm_samples) == ESP_OK &&
+                    pcm_samples > 0)
+                {
+                    koyoda_audio_duplex_playback_write(s_playback_pcm, pcm_samples);
+                }
             }
         }
         break;
@@ -557,6 +563,36 @@ static esp_err_t open_ws_channel(void)
         return ESP_ERR_TIMEOUT;
     }
 
+    /* Bring up Opus only now: it costs tens of KB and an idle KOYODA
+     * should hold none of it. */
+    if (koyoda_codec_open() != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Codec open failed; closing channel");
+        esp_websocket_client_stop(s_ws);
+        esp_websocket_client_destroy(s_ws);
+        s_ws = NULL;
+        return ESP_FAIL;
+    }
+
+    if (s_playback_pcm == NULL)
+    {
+        s_playback_pcm = heap_caps_malloc(
+            KOYODA_CODEC_MAX_PCM_OUT * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        if (s_playback_pcm == NULL)
+        {
+            s_playback_pcm = malloc(KOYODA_CODEC_MAX_PCM_OUT * sizeof(int16_t));
+        }
+        if (s_playback_pcm == NULL)
+        {
+            ESP_LOGE(TAG, "Playback buffer alloc failed; closing channel");
+            koyoda_codec_close();
+            esp_websocket_client_stop(s_ws);
+            esp_websocket_client_destroy(s_ws);
+            s_ws = NULL;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     s_channel_open = true;
     koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
     return ESP_OK;
@@ -572,6 +608,11 @@ static void close_ws_channel(void)
     }
     s_channel_open = false;
     s_playback_active = false;
+
+    /* Give the codec's tens of KB back so an idle pet holds none of it. */
+    koyoda_codec_close();
+    free(s_playback_pcm);
+    s_playback_pcm = NULL;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -624,6 +665,19 @@ static void mic_frame_callback(const int16_t *samples, size_t sample_count, bool
 /* Worker task: owns the state machine, the OTA check-in, the WebSocket     */
 /* client, and drains the mic queue.                                        */
 /* ------------------------------------------------------------------------- */
+
+/* Emits one encoded Opus frame onto the websocket. Called synchronously
+ * from koyoda_codec_encode_push() on the backend worker task. */
+static void opus_packet_ready(const uint8_t *data, size_t len, void *ctx)
+{
+    (void)ctx;
+    if (s_ws == NULL || !s_channel_open)
+    {
+        return;
+    }
+    esp_websocket_client_send_bin(
+        s_ws, (const char *)data, (int)len, pdMS_TO_TICKS(200));
+}
 
 static void backend_task(void *arg)
 {
@@ -696,22 +750,19 @@ static void backend_task(void *arg)
             else
             {
                 send_listen_state("stop", NULL);
+                /* Drop any partial frame so the next utterance starts clean. */
+                koyoda_codec_encode_reset();
             }
         }
 
-        /* Drain queued mic audio while the channel is open. */
+        /* Encode queued mic audio to Opus and send. All of the heavy
+         * lifting (resample + encode) happens here on the worker task,
+         * never on the audio owner task. */
         while (s_channel_open && s_ws != NULL &&
                xQueueReceive(s_mic_queue, &msg, 0) == pdTRUE)
         {
-            /*
-             * KOYODA_TODO_OPUS_ENCODE:
-             * msg.samples/msg.sample_count is raw PCM16LE. Encode to Opus
-             * here before sending if the target server requires it (the
-             * xiaozhi-esp32 default does). See koyoda_backend.h.
-             */
-            esp_websocket_client_send_bin(
-                s_ws, (const char *)msg.samples,
-                msg.sample_count * (int)sizeof(int16_t), pdMS_TO_TICKS(200));
+            koyoda_codec_encode_push(
+                msg.samples, msg.sample_count, opus_packet_ready, NULL);
         }
 
         /* Poll fast while a conversation is live so VAD events and audio
