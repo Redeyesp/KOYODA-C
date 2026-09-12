@@ -83,22 +83,50 @@ Two deliberate design points:
   (AI off) holds none of it. Buffers prefer PSRAM, because internal RAM
   on this board is shared with the LCD's DMA pool.
 
+## OTA / activation parity (implemented)
+
+The check-in now matches xiaozhi-esp32's `Ota::CheckVersion()`:
+
+**Headers sent:** `Activation-Version`, `Device-Id`, `Client-Id`,
+`User-Agent`, `Accept-Language`, `Content-Type`.
+(`Serial-Number` is not sent — it requires an eFuse-burned per-device
+secret that KOYODA has no provisioning flow for, so KOYODA advertises
+`Activation-Version: 1`.)
+
+**Body** follows `Board::GetSystemInfoJson()`: version 2, language,
+flash/PSRAM size, minimum free heap, MAC, UUID, chip info, full
+application block (name, version, compile time, IDF version, ELF
+SHA-256) and a board block with the current SSID/RSSI. The large
+`partition_table` array xiaozhi also sends is omitted deliberately —
+servers key off `mac_address`/`uuid`, and building it would cost several
+KB of heap on every reconnect.
+
+**Response sections parsed:** all five — `activation`, `mqtt`,
+`websocket`, `server_time`, `firmware`.
+
+- If the server returns an **activation code**, KOYODA prints it as a
+  banner in the serial log and keeps retrying. Enter the code in the
+  xiaozhi console and it connects on the next attempt.
+- `websocket.version` is now read and persisted to NVS instead of being
+  hard-coded, and is used for both the `Protocol-Version` header and the
+  `hello` message.
+- `server_time` sets the system clock, which also makes TLS certificate
+  validity checks behave.
+- `firmware` is reported in the log but **never auto-flashed**. This is
+  deliberate: a stray or hostile check-in response must not be able to
+  silently reflash a running pet.
+
 ### Still not at full xiaozhi parity
 
-These are known gaps, not oversights:
-
-- **Protocol version is hard-coded to 1.** Real xiaozhi reads
-  `websocket.version` from the OTA response and supports v1/v2/v3, which
-  use *different binary framing* (v2 has a 16-byte header, v3 a 4-byte
-  one). KOYODA only implements v1 (bare payload, no header).
-- **OTA check-in is partial.** It sends `Device-Id`, `Client-Id` and
-  `Content-Type`, but not `Activation-Version`, `User-Agent`,
-  `Accept-Language` or `Serial-Number`. It parses only `websocket` and
-  `firmware` from the response, ignoring `activation`, `mqtt` and
-  `server_time` — so the xiaozhi Console activation flow will not work
-  yet.
-- **No wake word / AFE.** KOYODA uses its own VAD; there is no
-  `esp-sr` integration.
+- **Binary framing for protocol v2/v3 is not implemented.** KOYODA now
+  *negotiates* the version but only speaks v1 (bare payload, no header).
+  v2 prepends a 16-byte header and v3 a 4-byte one. If a server hands
+  back version 2 or 3, audio framing will be wrong. This is the next
+  phase.
+- **Challenge-response activation (Activation-Version 2)** is not
+  supported; KOYODA logs a warning if a server sends a challenge.
+- **No wake word / AFE.** KOYODA uses its own VAD; there is no `esp-sr`
+  integration.
 
 ## Setup checklist
 

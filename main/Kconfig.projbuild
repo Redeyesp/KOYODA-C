@@ -28,6 +28,14 @@ config KOYODA_OTA_URL
         compatible test harness) rather than a public endpoint unless
         you know what you're doing.
 
+config KOYODA_LANGUAGE
+    string "Language code sent to the server"
+    default "en-US"
+    help
+        Sent as the Accept-Language header and the "language" field of
+        the check-in body, matching xiaozhi-esp32's Lang::CODE.
+        Use "zh-CN" for Chinese xiaozhi servers.
+
 config KOYODA_BOARD_NAME
     string "Board identifier sent to the server"
     default "koyoda-esp32s3-amoled-1.75"
@@ -35,5 +43,32 @@ config KOYODA_BOARD_NAME
         Sent in the OTA check-in body as "board". Purely informational;
         change it if you want your server-side logs/dashboard to show a
         friendlier name for this KOYODA unit.
+
+endmenu
+
+menu "KOYODA Audio Self-Test"
+
+config KOYODA_CODEC_SELFTEST
+    bool "Run Opus codec self-test at boot"
+    default n
+    help
+        Generates a 440 Hz tone, runs it through the full
+        resample -> Opus encode -> Opus decode -> resample chain and
+        reports PASS/FAIL with measured length, pitch and level to the
+        serial log. Needs no Wi-Fi, no server and no microphone.
+
+        Adds about a second to boot. Turn off for normal use.
+
+config KOYODA_ECHO_TEST
+    bool "Local echo test instead of network backend"
+    default n
+    help
+        Replaces the whole network backend with a local loopback:
+        speak, pause, and KOYODA replays your voice after a real
+        Opus encode/decode round trip.
+
+        Use this to confirm the microphone, resampling, codec and
+        speaker all work before blaming the server. KOYODA will NOT
+        connect to any backend while this is enabled.
 
 endmenu

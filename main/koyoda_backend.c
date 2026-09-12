@@ -14,6 +14,10 @@
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
 #include "esp_app_format.h"
+#include "esp_chip_info.h"
+#include "esp_psram.h"
+#include "esp_flash.h"
+#include <sys/time.h>
 #include "esp_ota_ops.h"
 #include "esp_random.h"
 #include "esp_websocket_client.h"
@@ -27,6 +31,7 @@
 #include "koyoda_audio_duplex.h"
 #include "koyoda_face_state.h"
 #include "koyoda_codec.h"
+#include "koyoda_codec_test.h"
 
 static const char *TAG = "KOYODA_BACKEND";
 
@@ -38,6 +43,10 @@ static const char *TAG = "KOYODA_BACKEND";
 #define CONFIG_KOYODA_OTA_URL "https://api.tenclass.net/xiaozhi/ota/"
 #endif
 
+#ifndef CONFIG_KOYODA_LANGUAGE
+#define CONFIG_KOYODA_LANGUAGE "en-US"
+#endif
+
 #ifndef CONFIG_KOYODA_BOARD_NAME
 #define CONFIG_KOYODA_BOARD_NAME "koyoda-esp32s3-amoled-1.75"
 #endif
@@ -46,6 +55,7 @@ static const char *TAG = "KOYODA_BACKEND";
 #define BACKEND_NVS_UUID_KEY    "uuid"
 #define BACKEND_NVS_WS_URL_KEY  "ws_url"
 #define BACKEND_NVS_WS_TOK_KEY  "ws_token"
+#define BACKEND_NVS_WS_VER_KEY  "ws_ver"
 
 /* Protocol version 1 == raw payload, no binary framing header. Matches
  * xiaozhi-esp32's WebsocketProtocol default. */
@@ -113,6 +123,11 @@ static char s_uuid[37] = {0};
 static char s_mac_str[18] = {0};
 static char s_ws_url[192] = {0};
 static char s_ws_token[128] = {0};
+static int  s_ws_version = KOYODA_PROTOCOL_VERSION;
+static bool s_activation_pending = false;
+static char s_activation_code[32] = {0};
+static char s_activation_message[128] = {0};
+static uint32_t s_flash_size = 0;
 
 static QueueHandle_t s_mic_queue = NULL;
 static QueueHandle_t s_ctrl_queue = NULL;
@@ -132,6 +147,23 @@ static volatile bool s_prev_vad = false;
  * it, and only one decode is ever in flight. */
 static int16_t *s_playback_pcm = NULL;
 
+#if CONFIG_KOYODA_ECHO_TEST
+/*
+ * Local echo test: mic -> resample -> Opus encode -> Opus decode ->
+ * resample -> speaker, with no network involved at all.
+ *
+ * koyoda_audio_duplex is half-duplex (mic pauses during playback), so a
+ * live echo is impossible. Instead we buffer the round-tripped audio
+ * while VAD says you are speaking, then replay it when you stop. Speak,
+ * pause, and you should hear yourself back at normal pitch and speed.
+ */
+#define ECHO_BUFFER_SECONDS 3
+#define ECHO_BUFFER_SAMPLES (KOYODA_PCM_SAMPLE_RATE * ECHO_BUFFER_SECONDS)
+static int16_t *s_echo_buf = NULL;
+static size_t s_echo_len = 0;
+static bool s_echo_active = false;
+#endif
+
 /* ------------------------------------------------------------------------- */
 /* Device identity: MAC string + a persistent random UUID, mirroring        */
 /* xiaozhi-esp32's SystemInfo::GetMacAddress() / Board::GetUuid().          */
@@ -139,6 +171,11 @@ static int16_t *s_playback_pcm = NULL;
 
 static void load_or_create_identity(void)
 {
+    if (esp_flash_get_size(NULL, &s_flash_size) != ESP_OK)
+    {
+        s_flash_size = 0;
+    }
+
     uint8_t mac[6] = {0};
     esp_wifi_get_mac(WIFI_IF_STA, mac);
     snprintf(s_mac_str, sizeof(s_mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -175,11 +212,17 @@ static void load_or_create_identity(void)
     nvs_get_str(handle, BACKEND_NVS_WS_URL_KEY, s_ws_url, &len);
     len = sizeof(s_ws_token);
     nvs_get_str(handle, BACKEND_NVS_WS_TOK_KEY, s_ws_token, &len);
+    int32_t stored_ver = 0;
+    if (nvs_get_i32(handle, BACKEND_NVS_WS_VER_KEY, &stored_ver) == ESP_OK &&
+        stored_ver != 0)
+    {
+        s_ws_version = (int)stored_ver;
+    }
 
     nvs_close(handle);
 }
 
-static void save_ws_target(const char *url, const char *token)
+static void save_ws_target(const char *url, const char *token, int version)
 {
     nvs_handle_t handle;
     if (nvs_open(BACKEND_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK)
@@ -194,6 +237,7 @@ static void save_ws_target(const char *url, const char *token)
     {
         nvs_set_str(handle, BACKEND_NVS_WS_TOK_KEY, token);
     }
+    nvs_set_i32(handle, BACKEND_NVS_WS_VER_KEY, (int32_t)version);
     nvs_commit(handle);
     nvs_close(handle);
 }
@@ -209,20 +253,235 @@ static void save_ws_target(const char *url, const char *token)
 /* real OTA flashing can be added later (esp_https_ota is already linked).  */
 /* ------------------------------------------------------------------------- */
 
+/*
+ * Parses all five sections xiaozhi-esp32's Ota::CheckVersion() handles:
+ * activation, mqtt, websocket, server_time and firmware.
+ * Returns ESP_OK only when a usable websocket target was obtained.
+ */
+static esp_err_t parse_checkin_response(const char *json)
+{
+    cJSON *root = cJSON_Parse(json);
+    if (root == NULL)
+    {
+        ESP_LOGW(TAG, "Check-in response was not valid JSON");
+        return ESP_FAIL;
+    }
+
+    esp_err_t result = ESP_FAIL;
+
+    /* ---- activation: device not yet bound to an account ---- */
+    s_activation_pending = false;
+    cJSON *activation = cJSON_GetObjectItem(root, "activation");
+    if (cJSON_IsObject(activation))
+    {
+        cJSON *code = cJSON_GetObjectItem(activation, "code");
+        cJSON *message = cJSON_GetObjectItem(activation, "message");
+        cJSON *challenge = cJSON_GetObjectItem(activation, "challenge");
+
+        if (cJSON_IsString(code))
+        {
+            strlcpy(s_activation_code, code->valuestring, sizeof(s_activation_code));
+            s_activation_pending = true;
+        }
+        if (cJSON_IsString(message))
+        {
+            strlcpy(s_activation_message, message->valuestring,
+                    sizeof(s_activation_message));
+        }
+
+        if (s_activation_pending)
+        {
+            ESP_LOGW(TAG, "==============================================");
+            ESP_LOGW(TAG, " DEVICE NOT ACTIVATED");
+            ESP_LOGW(TAG, " Activation code : %s", s_activation_code);
+            if (s_activation_message[0] != '\0')
+            {
+                ESP_LOGW(TAG, " Server message  : %s", s_activation_message);
+            }
+            ESP_LOGW(TAG, " Enter this code in the xiaozhi console, then");
+            ESP_LOGW(TAG, " KOYODA will retry automatically.");
+            ESP_LOGW(TAG, "==============================================");
+        }
+        if (cJSON_IsString(challenge))
+        {
+            /*
+             * Challenge-response activation (Activation-Version 2) needs
+             * an HMAC over a per-device secret burned into eFuse, which
+             * KOYODA has no provisioning flow for. We advertise
+             * Activation-Version 1 so servers should not send this; log
+             * it rather than pretend we handled it.
+             */
+            ESP_LOGW(TAG, "Server sent an activation challenge; "
+                          "KOYODA only supports Activation-Version 1");
+        }
+    }
+
+    /* ---- mqtt: parsed and logged only; KOYODA uses the websocket
+     * transport. Recorded so a mis-provisioned server is obvious. ---- */
+    cJSON *mqtt = cJSON_GetObjectItem(root, "mqtt");
+    if (cJSON_IsObject(mqtt))
+    {
+        cJSON *endpoint = cJSON_GetObjectItem(mqtt, "endpoint");
+        ESP_LOGI(TAG, "Server offered MQTT (%s); KOYODA uses websocket",
+                 cJSON_IsString(endpoint) ? endpoint->valuestring : "no endpoint");
+    }
+
+    /* ---- websocket: url, token and protocol version ---- */
+    cJSON *ws = cJSON_GetObjectItem(root, "websocket");
+    if (cJSON_IsObject(ws))
+    {
+        cJSON *url = cJSON_GetObjectItem(ws, "url");
+        cJSON *token = cJSON_GetObjectItem(ws, "token");
+        cJSON *ver = cJSON_GetObjectItem(ws, "version");
+
+        if (cJSON_IsString(url))
+        {
+            strlcpy(s_ws_url, url->valuestring, sizeof(s_ws_url));
+            strlcpy(s_ws_token,
+                    cJSON_IsString(token) ? token->valuestring : "",
+                    sizeof(s_ws_token));
+
+            if (cJSON_IsNumber(ver) && ver->valueint != 0)
+            {
+                s_ws_version = ver->valueint;
+            }
+
+            save_ws_target(s_ws_url, s_ws_token, s_ws_version);
+            ESP_LOGI(TAG, "Websocket target: %s (protocol version %d)",
+                     s_ws_url, s_ws_version);
+            result = ESP_OK;
+        }
+    }
+    else
+    {
+        ESP_LOGW(TAG, "No websocket section in check-in response");
+    }
+
+    /* ---- server_time: set the clock so TLS and logs are sane ---- */
+    cJSON *server_time = cJSON_GetObjectItem(root, "server_time");
+    if (cJSON_IsObject(server_time))
+    {
+        cJSON *timestamp = cJSON_GetObjectItem(server_time, "timestamp");
+        cJSON *tz_offset = cJSON_GetObjectItem(server_time, "timezone_offset");
+        if (cJSON_IsNumber(timestamp))
+        {
+            double ts = timestamp->valuedouble;
+            if (cJSON_IsNumber(tz_offset))
+            {
+                ts += ((double)tz_offset->valueint * 60.0 * 1000.0);
+            }
+            struct timeval tv;
+            tv.tv_sec = (time_t)(ts / 1000.0);
+            tv.tv_usec = (suseconds_t)(((long long)ts % 1000) * 1000);
+            settimeofday(&tv, NULL);
+            ESP_LOGI(TAG, "Clock set from server");
+        }
+    }
+
+    /* ---- firmware: reported only, never auto-flashed ---- */
+    cJSON *fw = cJSON_GetObjectItem(root, "firmware");
+    if (cJSON_IsObject(fw))
+    {
+        cJSON *fv = cJSON_GetObjectItem(fw, "version");
+        if (cJSON_IsString(fv))
+        {
+            const esp_app_desc_t *app_desc = esp_app_get_description();
+            if (strcmp(fv->valuestring, app_desc->version) != 0)
+            {
+                /*
+                 * Deliberately not calling esp_https_ota() here: a stray
+                 * or hostile check-in response must never be able to
+                 * silently reflash a running pet.
+                 */
+                ESP_LOGI(TAG, "Server has firmware %s (running %s); "
+                              "automatic OTA is intentionally disabled",
+                         fv->valuestring, app_desc->version);
+            }
+        }
+    }
+
+    cJSON_Delete(root);
+
+    /* An unactivated device gets no websocket target; say so plainly
+     * instead of reporting a generic failure. */
+    if (result != ESP_OK && s_activation_pending)
+    {
+        ESP_LOGW(TAG, "Waiting for activation before a channel can open");
+    }
+    return result;
+}
+
 static esp_err_t do_ota_checkin(void)
 {
     const esp_app_desc_t *app_desc = esp_app_get_description();
 
+    /*
+     * Body mirrors xiaozhi-esp32's Board::GetSystemInfoJson() closely
+     * enough for a server to identify and register the device:
+     * version 2, language, flash/heap, MAC, UUID, chip info and
+     * application details. The huge partition_table array that xiaozhi
+     * also sends is omitted -- servers key off mac_address/uuid, and it
+     * would cost several KB of heap on every reconnect.
+     */
     cJSON *body = cJSON_CreateObject();
+    cJSON_AddNumberToObject(body, "version", 2);
+    cJSON_AddStringToObject(body, "language", CONFIG_KOYODA_LANGUAGE);
+    cJSON_AddNumberToObject(body, "flash_size", (double)s_flash_size);
+    cJSON_AddNumberToObject(body, "psram_size", (double)esp_psram_get_size());
+    cJSON_AddNumberToObject(body, "minimum_free_heap_size",
+                            (double)esp_get_minimum_free_heap_size());
     cJSON_AddStringToObject(body, "mac_address", s_mac_str);
     cJSON_AddStringToObject(body, "uuid", s_uuid);
-    cJSON_AddStringToObject(body, "board", CONFIG_KOYODA_BOARD_NAME);
+    cJSON_AddStringToObject(body, "chip_model_name", "esp32s3");
+
+    esp_chip_info_t chip_info;
+    esp_chip_info(&chip_info);
+    cJSON *chip = cJSON_CreateObject();
+    cJSON_AddNumberToObject(chip, "model", chip_info.model);
+    cJSON_AddNumberToObject(chip, "cores", chip_info.cores);
+    cJSON_AddNumberToObject(chip, "revision", chip_info.revision);
+    cJSON_AddNumberToObject(chip, "features", chip_info.features);
+    cJSON_AddItemToObject(body, "chip_info", chip);
+
+    char compile_time[64];
+    snprintf(compile_time, sizeof(compile_time), "%sT%sZ",
+             app_desc->date, app_desc->time);
+    char elf_sha[65];
+    for (int i = 0; i < 32; i++)
+    {
+        snprintf(elf_sha + i * 2, sizeof(elf_sha) - i * 2, "%02x",
+                 app_desc->app_elf_sha256[i]);
+    }
+
     cJSON *application = cJSON_CreateObject();
-    cJSON_AddStringToObject(application, "name", "koyoda");
+    cJSON_AddStringToObject(application, "name", app_desc->project_name);
     cJSON_AddStringToObject(application, "version", app_desc->version);
+    cJSON_AddStringToObject(application, "compile_time", compile_time);
+    cJSON_AddStringToObject(application, "idf_version", app_desc->idf_ver);
+    cJSON_AddStringToObject(application, "elf_sha256", elf_sha);
     cJSON_AddItemToObject(body, "application", application);
+
+    cJSON *board_obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(board_obj, "type", CONFIG_KOYODA_BOARD_NAME);
+    cJSON_AddStringToObject(board_obj, "name", CONFIG_KOYODA_BOARD_NAME);
+    {
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK)
+        {
+            cJSON_AddStringToObject(board_obj, "ssid", (const char *)ap.ssid);
+            cJSON_AddNumberToObject(board_obj, "rssi", ap.rssi);
+            cJSON_AddNumberToObject(board_obj, "channel", ap.primary);
+        }
+    }
+    cJSON_AddStringToObject(board_obj, "mac", s_mac_str);
+    cJSON_AddItemToObject(body, "board", board_obj);
+
     char *body_str = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
+    if (body_str == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
 
     esp_http_client_config_t http_cfg = {
         .url = CONFIG_KOYODA_OTA_URL,
@@ -233,13 +492,21 @@ static esp_err_t do_ota_checkin(void)
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
     if (client == NULL)
     {
-        free(body_str);
+        cJSON_free(body_str);
         return ESP_FAIL;
     }
 
-    esp_http_client_set_header(client, "Content-Type", "application/json");
+    /* Header set matches xiaozhi-esp32's Ota::SetupHttp(). */
+    char user_agent[96];
+    snprintf(user_agent, sizeof(user_agent), "%s/%s",
+             CONFIG_KOYODA_BOARD_NAME, app_desc->version);
+
+    esp_http_client_set_header(client, "Activation-Version", "1");
     esp_http_client_set_header(client, "Device-Id", s_mac_str);
     esp_http_client_set_header(client, "Client-Id", s_uuid);
+    esp_http_client_set_header(client, "User-Agent", user_agent);
+    esp_http_client_set_header(client, "Accept-Language", CONFIG_KOYODA_LANGUAGE);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_post_field(client, body_str, (int)strlen(body_str));
 
     esp_err_t err = esp_http_client_perform(client);
@@ -250,7 +517,7 @@ static esp_err_t do_ota_checkin(void)
         int status = esp_http_client_get_status_code(client);
         int64_t content_len = esp_http_client_get_content_length(client);
 
-        if (status == 200 && content_len > 0 && content_len < 4096)
+        if (status == 200 && content_len > 0 && content_len < 8192)
         {
             char *resp = (char *)malloc((size_t)content_len + 1);
             if (resp != NULL)
@@ -259,48 +526,7 @@ static esp_err_t do_ota_checkin(void)
                 if (read > 0)
                 {
                     resp[read] = '\0';
-                    cJSON *root = cJSON_Parse(resp);
-                    if (root != NULL)
-                    {
-                        cJSON *ws = cJSON_GetObjectItem(root, "websocket");
-                        if (cJSON_IsObject(ws))
-                        {
-                            cJSON *url = cJSON_GetObjectItem(ws, "url");
-                            cJSON *token = cJSON_GetObjectItem(ws, "token");
-                            if (cJSON_IsString(url))
-                            {
-                                strlcpy(s_ws_url, url->valuestring, sizeof(s_ws_url));
-                                strlcpy(s_ws_token,
-                                        cJSON_IsString(token) ? token->valuestring : "",
-                                        sizeof(s_ws_token));
-                                save_ws_target(s_ws_url, s_ws_token);
-                                result = ESP_OK;
-                            }
-                        }
-
-                        cJSON *fw = cJSON_GetObjectItem(root, "firmware");
-                        if (cJSON_IsObject(fw))
-                        {
-                            cJSON *fv = cJSON_GetObjectItem(fw, "version");
-                            cJSON *fu = cJSON_GetObjectItem(fw, "url");
-                            if (cJSON_IsString(fv) && cJSON_IsString(fu))
-                            {
-                                /*
-                                 * KOYODA_TODO_REAL_OTA:
-                                 * Compare fv->valuestring against
-                                 * app_desc->version and, if newer, call
-                                 * esp_https_ota() with fu->valuestring
-                                 * then esp_restart(). Left as a manual
-                                 * step for now so a stray OTA server
-                                 * response can never silently reflash a
-                                 * running pet.
-                                 */
-                                ESP_LOGI(TAG, "OTA check-in reports firmware %s (running %s)",
-                                         fv->valuestring, app_desc->version);
-                            }
-                        }
-                        cJSON_Delete(root);
-                    }
+                    result = parse_checkin_response(resp);
                 }
                 free(resp);
             }
@@ -316,7 +542,7 @@ static esp_err_t do_ota_checkin(void)
     }
 
     esp_http_client_cleanup(client);
-    free(body_str);
+    cJSON_free(body_str);
     return result;
 }
 
@@ -340,7 +566,7 @@ static void send_hello(void)
 {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "hello");
-    cJSON_AddNumberToObject(root, "version", KOYODA_PROTOCOL_VERSION);
+    cJSON_AddNumberToObject(root, "version", s_ws_version);
     cJSON *features = cJSON_CreateObject();
     cJSON_AddBoolToObject(features, "mcp", false);
     cJSON_AddItemToObject(root, "features", features);
@@ -521,7 +747,9 @@ static esp_err_t open_ws_channel(void)
         }
         esp_websocket_client_append_header(s_ws, "Authorization", auth);
     }
-    esp_websocket_client_append_header(s_ws, "Protocol-Version", "1");
+    char ver_str[8];
+    snprintf(ver_str, sizeof(ver_str), "%d", s_ws_version);
+    esp_websocket_client_append_header(s_ws, "Protocol-Version", ver_str);
     esp_websocket_client_append_header(s_ws, "Device-Id", s_mac_str);
     esp_websocket_client_append_header(s_ws, "Client-Id", s_uuid);
 
@@ -625,7 +853,12 @@ static void mic_frame_callback(const int16_t *samples, size_t sample_count, bool
 {
     (void)ctx;
 
-    if (!koyoda_audio_duplex_ai_is_enabled() || !s_channel_open ||
+    bool path_open = s_channel_open;
+#if CONFIG_KOYODA_ECHO_TEST
+    path_open = s_echo_active;
+#endif
+
+    if (!koyoda_audio_duplex_ai_is_enabled() || !path_open ||
         s_mic_queue == NULL || s_ctrl_queue == NULL)
     {
         s_prev_vad = false;
@@ -679,6 +912,121 @@ static void opus_packet_ready(const uint8_t *data, size_t len, void *ctx)
         s_ws, (const char *)data, (int)len, pdMS_TO_TICKS(200));
 }
 
+#if CONFIG_KOYODA_ECHO_TEST
+/* Decode each freshly encoded frame straight back and stash the PCM. */
+static void echo_packet_ready(const uint8_t *data, size_t len, void *ctx)
+{
+    (void)ctx;
+    if (s_echo_buf == NULL || s_playback_pcm == NULL)
+    {
+        return;
+    }
+    size_t produced = 0;
+    if (koyoda_codec_decode(data, len, s_playback_pcm,
+                            KOYODA_CODEC_MAX_PCM_OUT, &produced) != ESP_OK)
+    {
+        return;
+    }
+    size_t space = ECHO_BUFFER_SAMPLES - s_echo_len;
+    if (produced > space)
+    {
+        produced = space;
+    }
+    memcpy(&s_echo_buf[s_echo_len], s_playback_pcm, produced * sizeof(int16_t));
+    s_echo_len += produced;
+}
+
+static void echo_replay(void)
+{
+    if (s_echo_len == 0)
+    {
+        return;
+    }
+    ESP_LOGI(TAG, "ECHO: replaying %u samples (%.2f s)",
+             (unsigned)s_echo_len,
+             (double)s_echo_len / (double)KOYODA_PCM_SAMPLE_RATE);
+
+    if (koyoda_audio_duplex_playback_start() == ESP_OK)
+    {
+        const size_t chunk = 512;
+        for (size_t off = 0; off < s_echo_len; off += chunk)
+        {
+            size_t n = s_echo_len - off;
+            if (n > chunk) n = chunk;
+            koyoda_audio_duplex_playback_write(&s_echo_buf[off], n);
+        }
+        koyoda_audio_duplex_playback_end();
+    }
+    s_echo_len = 0;
+}
+
+/* Runs instead of the network path when the echo test is compiled in. */
+static void echo_tick(bool ai_on)
+{
+    if (ai_on && !s_echo_active)
+    {
+        if (koyoda_codec_open() != ESP_OK)
+        {
+            return;
+        }
+        if (s_playback_pcm == NULL)
+        {
+            s_playback_pcm = heap_caps_malloc(
+                KOYODA_CODEC_MAX_PCM_OUT * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        }
+        if (s_echo_buf == NULL)
+        {
+            s_echo_buf = heap_caps_malloc(
+                ECHO_BUFFER_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        }
+        if (s_playback_pcm == NULL || s_echo_buf == NULL)
+        {
+            ESP_LOGE(TAG, "ECHO: buffer alloc failed");
+            koyoda_codec_close();
+            return;
+        }
+        s_echo_len = 0;
+        s_echo_active = true;
+        ESP_LOGI(TAG, "ECHO TEST ARMED: speak, then pause to hear yourself");
+    }
+    else if (!ai_on && s_echo_active)
+    {
+        s_echo_active = false;
+        s_echo_len = 0;
+        koyoda_codec_close();
+        free(s_playback_pcm); s_playback_pcm = NULL;
+        free(s_echo_buf);     s_echo_buf = NULL;
+        ESP_LOGI(TAG, "ECHO TEST disarmed");
+    }
+
+    if (!s_echo_active)
+    {
+        return;
+    }
+
+    backend_ctrl_t ev;
+    while (xQueueReceive(s_ctrl_queue, &ev, 0) == pdTRUE)
+    {
+        if (ev == BE_CTRL_LISTEN_START)
+        {
+            s_echo_len = 0;
+            koyoda_codec_encode_reset();
+            ESP_LOGI(TAG, "ECHO: recording...");
+        }
+        else
+        {
+            echo_replay();
+        }
+    }
+
+    mic_frame_msg_t m;
+    while (xQueueReceive(s_mic_queue, &m, 0) == pdTRUE)
+    {
+        koyoda_codec_encode_push(m.samples, m.sample_count, echo_packet_ready, NULL);
+    }
+}
+#endif /* CONFIG_KOYODA_ECHO_TEST */
+
 static void backend_task(void *arg)
 {
     (void)arg;
@@ -687,6 +1035,14 @@ static void backend_task(void *arg)
     while (1)
     {
         bool ai_on = koyoda_audio_duplex_ai_is_enabled();
+
+#if CONFIG_KOYODA_ECHO_TEST
+        /* Echo test replaces the network path entirely. */
+        echo_tick(ai_on);
+        vTaskDelay(pdMS_TO_TICKS(ai_on ? BACKEND_ACTIVE_TICK_MS : BACKEND_TICK_MS));
+        continue;
+#endif
+
         bool wifi_up = s_wifi_connected;
         uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 
@@ -778,6 +1134,12 @@ static void backend_task(void *arg)
 
 esp_err_t koyoda_backend_start(void)
 {
+#if CONFIG_KOYODA_CODEC_SELFTEST
+    /* Runs before anything else claims memory, so a failure here is the
+     * codec's fault and not fragmentation. */
+    (void)koyoda_codec_selftest_run();
+#endif
+
     load_or_create_identity();
 
     s_events = xEventGroupCreate();
