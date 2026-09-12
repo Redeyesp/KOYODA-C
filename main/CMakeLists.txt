@@ -9,6 +9,7 @@ idf_component_register(
          "koyoda_audio_duplex.c"
          "koyoda_backend.c"
          "koyoda_codec.c"
+         "koyoda_codec_test.c"
          "koyoda_face_state.c"
          "koyoda_ai_overlays.c"
          "koyoda_charge_composite.c"
@@ -31,6 +32,11 @@ idf_component_register(
          app_update
          mbedtls
          json
+         # Needed by the OTA check-in body: esp_psram.h reports PSRAM size,
+         # esp_flash.h reports flash size. Both are separate components in
+         # ESP-IDF 5.x and are not pulled in transitively.
+         esp_psram
+         spi_flash
     # NOTE: esp_websocket_client is intentionally NOT listed here. It is a
     # managed component declared in idf_component.yml, and the component
     # manager wires it into this component automatically.
