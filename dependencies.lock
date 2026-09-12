@@ -58,7 +58,7 @@ dependencies:
       type: service
     version: 2.0.3
   espressif/esp_lcd_co5300:
-    component_hash: 21f84c5c825509ebacbddb379555b49092ae165b3e19f0edfbf6f8eff8aa036d
+    component_hash: 1a5cbaa0069c3c72c238e5a1eb32ec9dd390ec1c7c46b24bf44b9037f2fe6c56
     dependencies:
     - name: espressif/cmake_utilities
       registry_url: https://components.espressif.com
@@ -70,7 +70,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 2.1.0
+    version: 2.2.0
   espressif/esp_lcd_panel_io_additions:
     component_hash: 1856c8b2c11aaa8a9fd67481582162bcad25f7064661a995f35c2ee8dd10ebcc
     dependencies:
@@ -349,5 +349,5 @@ direct_dependencies:
 - lvgl/lvgl
 - waveshare/esp32_s3_touch_amoled_1_75
 manifest_hash: 01d2e979e73981d9de10e6bd49606d69fdc3abf98e9630b6084901edde9a5469
-target: esp32s3
+target: esp32
 version: 2.0.0

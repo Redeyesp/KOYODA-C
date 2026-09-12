@@ -2,3 +2,7 @@ build/
 managed_components/
 .cache/
 sdkconfig.old
+
+# Never commit the build-time Wi-Fi fallback header (CI generates this
+# transiently from repo secrets and deletes it after every build).
+main/koyoda_wifi_secrets.h

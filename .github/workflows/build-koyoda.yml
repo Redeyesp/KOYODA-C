@@ -1,0 +1,225 @@
+name: KOYODA real charging
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "main/**"
+      - "sdkconfig"
+      - "dependencies.lock"
+      - "partitions.csv"
+      - ".github/workflows/build-koyoda.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify source and core KOYODA assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -f sdkconfig
+          test -f dependencies.lock
+          test -f partitions.csv
+          grep -qx 'CONFIG_IDF_TARGET="esp32s3"' sdkconfig
+
+          echo "c94552bc194a415a55bccf607e845776f834eb3884f677310e6c66ad30448c46  main/koyoda_idle.c" | sha256sum -c -
+
+          git ls-files -z main assets | xargs -0 sha256sum > source-assets.sha256
+
+
+      - name: Create private Wi-Fi build header
+        shell: bash
+        env:
+          KOYODA_WIFI_SSID: ${{ secrets.KOYODA_WIFI_SSID }}
+          KOYODA_WIFI_PASSWORD: ${{ secrets.KOYODA_WIFI_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${KOYODA_WIFI_SSID:-}" ]; then
+            echo "::error::KOYODA_WIFI_SSID repository secret is missing or empty."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          ssid = os.environ["KOYODA_WIFI_SSID"]
+          password = os.environ.get("KOYODA_WIFI_PASSWORD", "")
+
+          Path("main/koyoda_wifi_secrets.h").write_text(
+              "#pragma once\n"
+              f"#define KOYODA_WIFI_SSID {json.dumps(ssid, ensure_ascii=False)}\n"
+              f"#define KOYODA_WIFI_PASSWORD {json.dumps(password, ensure_ascii=False)}\n",
+              encoding="utf-8",
+          )
+
+          print("Private Wi-Fi header created.")
+          print("SSID configured: yes")
+          print("Password configured:", "yes" if password else "no")
+          PY
+
+
+      - name: Ensure factory partition is large enough
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+
+          p = Path("partitions.csv")
+          original = p.read_text()
+          rows = [
+              [v.strip() for v in row]
+              for row in csv.reader(
+                  line for line in original.splitlines()
+                  if line.strip() and not line.lstrip().startswith("#")
+              )
+          ]
+
+          if len(rows) != 3:
+              raise SystemExit("Unexpected partition layout; refusing to modify it.")
+
+          if rows[0][:5] != ["nvs", "data", "nvs", "0x9000", "0x6000"]:
+              raise SystemExit("Unexpected NVS partition.")
+          if rows[1][:5] != ["phy_init", "data", "phy", "0xf000", "0x1000"]:
+              raise SystemExit("Unexpected PHY partition.")
+          if rows[2][:4] != ["factory", "app", "factory", "0x10000"]:
+              raise SystemExit("Unexpected factory partition.")
+
+          size = rows[2][4]
+          if size not in ("4M", "6M", "8M", "12M"):
+              raise SystemExit(f"Unexpected factory partition size: {size}")
+
+          Path("partitions-baseline.csv").write_text(original)
+
+          if size == "4M":
+              p.write_text(original.replace("4M", "6M", 1))
+
+          print(p.read_text())
+          PY
+
+          git diff -- partitions.csv > partition-fix.patch
+
+      - name: Build with ESP-IDF 5.5.4 on Linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm             --user "$(id -u):$(id -g)"             -e HOME=/tmp/koyoda-idf-home             -e CCACHE_DISABLE=1             -v "$GITHUB_WORKSPACE:/project"             -w /project             espressif/idf:v5.5.4             bash -c 'set -euo pipefail; mkdir -p "$HOME"; idf.py --version; idf.py -B build-ci build'             2>&1 | tee koyoda-build.log
+
+      - name: Remove private Wi-Fi build header
+        if: always()
+        shell: bash
+        run: rm -f main/koyoda_wifi_secrets.h
+
+      - name: Package firmware and verify assets stayed unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum -c source-assets.sha256
+          git diff --exit-code -- main assets
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+
+          build = Path("build-ci")
+          out = Path("firmware")
+          out.mkdir(exist_ok=True)
+
+          info = json.loads((build / "flasher_args.json").read_text())
+
+          for relative in info["flash_files"].values():
+              source = (build / relative).resolve()
+              if not source.is_relative_to(build.resolve()):
+                  raise ValueError(f"Unexpected binary path: {relative}")
+              dest = out / relative
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(source, dest)
+
+          for name in ("flash_args", "flasher_args.json"):
+              shutil.copy2(build / name, out / name)
+
+          for name in (
+              "sdkconfig",
+              "dependencies.lock",
+              "partitions.csv",
+              "partitions-baseline.csv",
+              "partition-fix.patch",
+              "source-assets.sha256",
+          ):
+              shutil.copy2(name, out / name)
+
+          factory_size = "unknown"
+          for line in Path("partitions.csv").read_text().splitlines():
+              if line.strip().startswith("factory"):
+                  factory_size = line.split(",")[4].strip()
+                  break
+
+          (out / "BUILD-INFO.txt").write_text(
+              f"KOYODA source commit: {os.environ['SOURCE_SHA']}\n"
+              "ESP-IDF: v5.5.4\n"
+              "Target: esp32s3\n"
+              f"Factory partition: {factory_size} at offset 0x10000.\n"
+              "Current face and charging assets verified unchanged.\n"
+          )
+
+          (out / "FLASH-WINDOWS.txt").write_text(
+              "Open an ESP-IDF 5.5.4 terminal on Windows.\n"
+              "Extract this artifact and change directory to this folder.\n"
+              "Close any serial monitor before flashing.\n\n"
+              "python -m esptool --chip esp32s3 --port COM11 --baud 460800 "
+              "--before default_reset --after hard_reset write_flash \"@flash_args\"\n"
+          )
+
+          sums = []
+          for path in sorted(out.rglob("*")):
+              if path.is_file():
+                  sha = hashlib.sha256(path.read_bytes()).hexdigest()
+                  sums.append(f"{sha}  {path.relative_to(out).as_posix()}")
+
+          (out / "SHA256SUMS.txt").write_text("\n".join(sums) + "\n")
+          PY
+
+      - name: Upload firmware for Windows flashing
+        uses: actions/upload-artifact@v4
+        with:
+          name: KOYODA-real-charging-${{ github.run_number }}-IDF-5.5.4
+          path: firmware/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: KOYODA-build-logs-${{ github.run_number }}
+          path: |
+            koyoda-build.log
+            build-ci/log/
+            build-ci/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: warn
+          retention-days: 14
