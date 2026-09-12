@@ -551,52 +551,85 @@ static esp_err_t do_ota_checkin(void)
     esp_http_client_set_header(client, "User-Agent", user_agent);
     esp_http_client_set_header(client, "Accept-Language", CONFIG_KOYODA_LANGUAGE);
     esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_post_field(client, body_str, (int)strlen(body_str));
 
-    esp_err_t err = esp_http_client_perform(client);
+    /*
+     * Deliberately NOT esp_http_client_perform(): that call consumes and
+     * discards the response body internally, so a later
+     * esp_http_client_read_response() always returns 0 and the server's
+     * reply is lost. open/write/fetch_headers/read keeps it.
+     */
     esp_err_t result = ESP_FAIL;
+    size_t body_len = strlen(body_str);
 
-    if (err == ESP_OK)
+    esp_err_t err = esp_http_client_open(client, (int)body_len);
+    if (err != ESP_OK)
     {
-        int status = esp_http_client_get_status_code(client);
-        int64_t content_len = esp_http_client_get_content_length(client);
+        ESP_LOGW(TAG, "OTA check-in connect failed: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        cJSON_free(body_str);
+        return ESP_FAIL;
+    }
 
-        if (content_len > 0 && content_len < 8192)
+    int written = esp_http_client_write(client, body_str, (int)body_len);
+    if (written != (int)body_len)
+    {
+        ESP_LOGW(TAG, "OTA check-in short write (%d of %u)",
+                 written, (unsigned)body_len);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        cJSON_free(body_str);
+        return ESP_FAIL;
+    }
+
+    int64_t content_len = esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+
+    /* content_len is -1 for chunked replies, so always use a fixed buffer
+     * and read until the server stops sending. */
+    const size_t resp_cap = 4096;
+    char *resp = (char *)malloc(resp_cap);
+    int total = 0;
+    if (resp != NULL)
+    {
+        while (total < (int)resp_cap - 1)
         {
-            char *resp = (char *)malloc((size_t)content_len + 1);
-            if (resp != NULL)
+            int n = esp_http_client_read(client, resp + total,
+                                         (int)resp_cap - 1 - total);
+            if (n <= 0)
             {
-                int read = esp_http_client_read_response(client, resp, (int)content_len);
-                if (read > 0)
-                {
-                    resp[read] = '\0';
-                    if (status == 200)
-                    {
-                        result = parse_checkin_response(resp);
-                    }
-                    else
-                    {
-                        /* Show what the server actually objected to instead
-                         * of just the status code. */
-                        ESP_LOGW(TAG, "Check-in rejected: HTTP %d", status);
-                        ESP_LOGW(TAG, "Server said: %s", resp);
-                        ESP_LOGW(TAG, "Request was: %s", body_str);
-                    }
-                }
-                free(resp);
+                break;
             }
+            total += n;
         }
-        else
-        {
-            ESP_LOGW(TAG, "OTA check-in HTTP status=%d len=%lld (no body)",
-                     status, (long long)content_len);
-        }
+        resp[total > 0 ? total : 0] = '\0';
+    }
+
+    esp_http_client_close(client);
+
+    ESP_LOGI(TAG, "Check-in HTTP %d, content-length %lld, read %d bytes",
+             status, (long long)content_len, total);
+
+    if (resp == NULL)
+    {
+        ESP_LOGW(TAG, "Out of memory reading check-in response");
+    }
+    else if (total <= 0)
+    {
+        ESP_LOGW(TAG, "Server returned HTTP %d with an empty body", status);
+    }
+    else if (status == 200)
+    {
+        result = parse_checkin_response(resp);
     }
     else
     {
-        ESP_LOGW(TAG, "OTA check-in failed: %s", esp_err_to_name(err));
+        /* Show what the server actually objected to, not just the code. */
+        ESP_LOGW(TAG, "Check-in rejected: HTTP %d", status);
+        ESP_LOGW(TAG, "Server said: %s", resp);
+        ESP_LOGW(TAG, "Request was: %s", body_str);
     }
 
+    free(resp);
     esp_http_client_cleanup(client);
     cJSON_free(body_str);
 
