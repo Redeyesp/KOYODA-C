@@ -4,3 +4,8 @@ dependencies:
   lvgl/lvgl:
     version: "9.4.*"
     public: true
+  # WebSocket client for the xiaozhi backend. This is NOT a built-in
+  # ESP-IDF component (it was moved to the component registry), so it
+  # must be declared here rather than in CMakeLists REQUIRES.
+  espressif/esp_websocket_client:
+    version: "~1.7.0"

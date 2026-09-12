@@ -28,7 +28,9 @@ idf_component_register(
          esp_http_client
          esp_https_ota
          app_update
-         esp_websocket_client
          mbedtls
          json
+    # NOTE: esp_websocket_client is intentionally NOT listed here. It is a
+    # managed component declared in idf_component.yml, and the component
+    # manager wires it into this component automatically.
 )

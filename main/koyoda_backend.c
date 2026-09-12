@@ -93,6 +93,7 @@ static TaskHandle_t s_task = NULL;
 static esp_websocket_client_handle_t s_ws = NULL;
 static EventGroupHandle_t s_events = NULL;
 #define WS_HELLO_BIT BIT0
+#define WS_CONNECTED_BIT BIT1
 
 static volatile bool s_channel_open = false;
 static volatile bool s_playback_active = false;
@@ -399,8 +400,11 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
     switch (event_id)
     {
     case WEBSOCKET_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "WebSocket connected; sending hello");
-        send_hello();
+        ESP_LOGI(TAG, "WebSocket connected");
+        /* Do NOT send from this handler: it runs on the websocket
+         * client's own task, and sending with a long timeout from here
+         * can deadlock. The worker task sends "hello" instead. */
+        xEventGroupSetBits(s_events, WS_CONNECTED_BIT);
         break;
 
     case WEBSOCKET_EVENT_DATA:
@@ -487,7 +491,7 @@ static esp_err_t open_ws_channel(void)
 
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL);
 
-    xEventGroupClearBits(s_events, WS_HELLO_BIT);
+    xEventGroupClearBits(s_events, WS_HELLO_BIT | WS_CONNECTED_BIT);
     esp_err_t err = esp_websocket_client_start(s_ws);
     if (err != ESP_OK)
     {
@@ -496,7 +500,22 @@ static esp_err_t open_ws_channel(void)
         return err;
     }
 
+    /* Wait for the TCP/TLS handshake to complete before sending. */
     EventBits_t bits = xEventGroupWaitBits(
+        s_events, WS_CONNECTED_BIT, pdTRUE, pdFALSE,
+        pdMS_TO_TICKS(BACKEND_WS_HELLO_TIMEOUT_MS));
+    if (!(bits & WS_CONNECTED_BIT))
+    {
+        ESP_LOGW(TAG, "WebSocket did not connect within timeout");
+        esp_websocket_client_stop(s_ws);
+        esp_websocket_client_destroy(s_ws);
+        s_ws = NULL;
+        return ESP_ERR_TIMEOUT;
+    }
+
+    send_hello();
+
+    bits = xEventGroupWaitBits(
         s_events, WS_HELLO_BIT, pdTRUE, pdFALSE,
         pdMS_TO_TICKS(BACKEND_WS_HELLO_TIMEOUT_MS));
     if (!(bits & WS_HELLO_BIT))
