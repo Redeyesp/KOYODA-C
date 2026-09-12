@@ -33,14 +33,73 @@ jobs:
       - name: Verify source and core KOYODA assets
         shell: bash
         run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test -f sdkconfig
-          test -f dependencies.lock
-          test -f partitions.csv
-          grep -qx 'CONFIG_IDF_TARGET="esp32s3"' sdkconfig
+          set -uo pipefail
+          fail=0
 
-          echo "c94552bc194a415a55bccf607e845776f834eb3884f677310e6c66ad30448c46  main/koyoda_idle.c" | sha256sum -c -
+          echo "=== Files actually present at repo root ==="
+          ls -la
+
+          echo
+          echo "=== Required files ==="
+          for f in sdkconfig dependencies.lock partitions.csv; do
+            if [ -f "$f" ]; then
+              echo "OK      present: $f"
+            else
+              echo "MISSING: $f  <-- not committed to the repo"
+              fail=1
+            fi
+          done
+
+          echo
+          echo "=== Commit check ==="
+          head_sha="$(git rev-parse HEAD)"
+          if [ "$head_sha" = "$SOURCE_SHA" ]; then
+            echo "OK      HEAD matches triggering commit"
+          else
+            echo "MISMATCH: HEAD=$head_sha expected=$SOURCE_SHA"
+            fail=1
+          fi
+
+          echo
+          echo "=== Target check ==="
+          if [ -f sdkconfig ]; then
+            if grep -qx 'CONFIG_IDF_TARGET="esp32s3"' sdkconfig; then
+              echo "OK      CONFIG_IDF_TARGET=\"esp32s3\""
+            else
+              echo "BAD     expected CONFIG_IDF_TARGET=\"esp32s3\"; found:"
+              grep -n 'CONFIG_IDF_TARGET' sdkconfig || echo "  (no CONFIG_IDF_TARGET line at all)"
+              echo "  If the line looks right, it may have Windows CRLF endings."
+              fail=1
+            fi
+          else
+            echo "SKIPPED (sdkconfig missing)"
+          fi
+
+          echo
+          echo "=== Face asset integrity ==="
+          if [ -f main/koyoda_idle.c ]; then
+            actual="$(sha256sum main/koyoda_idle.c | cut -d' ' -f1)"
+            expected="c94552bc194a415a55bccf607e845776f834eb3884f677310e6c66ad30448c46"
+            if [ "$actual" = "$expected" ]; then
+              echo "OK      main/koyoda_idle.c unchanged"
+            else
+              echo "CHANGED main/koyoda_idle.c"
+              echo "  expected: $expected"
+              echo "  actual:   $actual"
+              echo "  Usually means line endings were converted on commit (CRLF)."
+              fail=1
+            fi
+          else
+            echo "MISSING: main/koyoda_idle.c"
+            fail=1
+          fi
+
+          echo
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Verification failed. See the checks marked MISSING/BAD/CHANGED above."
+            exit 1
+          fi
+          echo "All verification checks passed."
 
           git ls-files -z main assets | xargs -0 sha256sum > source-assets.sha256
 
