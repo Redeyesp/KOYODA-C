@@ -121,8 +121,12 @@ jobs:
           set -euo pipefail
 
           if [ -z "${KOYODA_WIFI_SSID:-}" ]; then
-            echo "::error::KOYODA_WIFI_SSID repository secret is missing or empty."
-            exit 1
+            echo "::notice::No KOYODA_WIFI_SSID secret set; building without a baked-in fallback network."
+            echo "KOYODA will boot with no stored credentials and start its"
+            echo "KOYODA-Setup provisioning hotspot, which is the normal path."
+            echo "To bake in a fallback network, add the KOYODA_WIFI_SSID"
+            echo "(and optionally KOYODA_WIFI_PASSWORD) repository secret."
+            exit 0
           fi
 
           python3 - <<'PY'
@@ -193,6 +197,32 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm             --user "$(id -u):$(id -g)"             -e HOME=/tmp/koyoda-idf-home             -e CCACHE_DISABLE=1             -v "$GITHUB_WORKSPACE:/project"             -w /project             espressif/idf:v5.5.4             bash -c 'set -euo pipefail; mkdir -p "$HOME"; idf.py --version; idf.py -B build-ci set-target esp32s3; grep -n "^CONFIG_IDF_TARGET=" sdkconfig; idf.py -B build-ci build'             2>&1 | tee koyoda-build.log
+
+      - name: Show compiler errors
+        if: failure()
+        shell: bash
+        run: |
+          echo "================= COMPILER ERRORS ================="
+          if [ -f koyoda-build.log ]; then
+            grep -n -i -B 8 -A 20 -E '\b(error|Error)\b:' koyoda-build.log | head -300 \
+              || echo "(no lines matching 'error:' found)"
+          else
+            echo "koyoda-build.log not found"
+          fi
+
+          echo
+          echo "================= FAILED COMMANDS ================="
+          grep -n -A 30 'FAILED:' koyoda-build.log 2>/dev/null | head -200 \
+            || echo "(no FAILED: lines)"
+
+          echo
+          echo "================= IDF STDERR LOGS ================="
+          for f in build-ci/log/idf_py_stderr_output_*; do
+            [ -f "$f" ] || continue
+            echo "----- $f -----"
+            tail -120 "$f"
+          done
+          exit 0
 
       - name: Remove private Wi-Fi build header
         if: always()
