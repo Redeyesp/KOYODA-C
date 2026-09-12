@@ -11,6 +11,7 @@
 
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "esp_netif.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
 #include "esp_app_format.h"
@@ -19,6 +20,7 @@
 #include "esp_flash.h"
 #include <sys/time.h>
 #include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "esp_random.h"
 #include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
@@ -461,9 +463,43 @@ static esp_err_t do_ota_checkin(void)
     cJSON_AddStringToObject(application, "elf_sha256", elf_sha);
     cJSON_AddItemToObject(body, "application", application);
 
+    /* partition_table / ota / display: xiaozhi's official server appears
+     * to validate the full body shape, so send all of it rather than the
+     * trimmed version. Cost is ~1-2 KB of heap per check-in. */
+    cJSON *parts = cJSON_CreateArray();
+    esp_partition_iterator_t it =
+        esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
+    while (it != NULL)
+    {
+        const esp_partition_t *p = esp_partition_get(it);
+        cJSON *pj = cJSON_CreateObject();
+        cJSON_AddStringToObject(pj, "label", p->label);
+        cJSON_AddNumberToObject(pj, "type", p->type);
+        cJSON_AddNumberToObject(pj, "subtype", p->subtype);
+        cJSON_AddNumberToObject(pj, "address", (double)p->address);
+        cJSON_AddNumberToObject(pj, "size", (double)p->size);
+        cJSON_AddItemToArray(parts, pj);
+        it = esp_partition_next(it);
+    }
+    esp_partition_iterator_release(it);
+    cJSON_AddItemToObject(body, "partition_table", parts);
+
+    cJSON *ota_obj = cJSON_CreateObject();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    cJSON_AddStringToObject(ota_obj, "label",
+                            running != NULL ? running->label : "factory");
+    cJSON_AddItemToObject(body, "ota", ota_obj);
+
+    cJSON *display = cJSON_CreateObject();
+    cJSON_AddBoolToObject(display, "monochrome", false);
+    cJSON_AddNumberToObject(display, "width", 466);
+    cJSON_AddNumberToObject(display, "height", 466);
+    cJSON_AddItemToObject(body, "display", display);
+
     cJSON *board_obj = cJSON_CreateObject();
     cJSON_AddStringToObject(board_obj, "type", CONFIG_KOYODA_BOARD_NAME);
     cJSON_AddStringToObject(board_obj, "name", CONFIG_KOYODA_BOARD_NAME);
+    cJSON_AddStringToObject(board_obj, "manufacturer", "koyoda");
     {
         wifi_ap_record_t ap;
         if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK)
@@ -471,6 +507,14 @@ static esp_err_t do_ota_checkin(void)
             cJSON_AddStringToObject(board_obj, "ssid", (const char *)ap.ssid);
             cJSON_AddNumberToObject(board_obj, "rssi", ap.rssi);
             cJSON_AddNumberToObject(board_obj, "channel", ap.primary);
+        }
+        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        esp_netif_ip_info_t ip_info;
+        if (netif != NULL && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK)
+        {
+            char ip_str[16];
+            snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+            cJSON_AddStringToObject(board_obj, "ip", ip_str);
         }
     }
     cJSON_AddStringToObject(board_obj, "mac", s_mac_str);

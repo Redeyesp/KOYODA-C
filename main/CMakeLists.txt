@@ -37,6 +37,7 @@ idf_component_register(
          # ESP-IDF 5.x and are not pulled in transitively.
          esp_psram
          spi_flash
+         esp_partition
     # NOTE: esp_websocket_client is intentionally NOT listed here. It is a
     # managed component declared in idf_component.yml, and the component
     # manager wires it into this component automatically.
