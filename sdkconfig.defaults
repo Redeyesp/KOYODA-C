@@ -42,3 +42,19 @@ CONFIG_BSP_LCD_TRANS_QUEUE_DEPTH=2
 # audio channel (WSS) can verify the server certificate.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+
+# CRITICAL for this board: without these, mbedtls allocates its TLS
+# buffers (tens of KB) from internal RAM -- the same pool the LCD needs
+# for DMA flush buffers. The symptom is
+#   "setup_dma_priv_buffer: Failed to allocate priv TX buffer"
+#   "Draw bitmap failed: ESP_ERR_NO_MEM"
+# and a ghosting/torn face the moment AI mode opens an HTTPS connection.
+# EXTERNAL_MEM_ALLOC pushes mbedtls onto PSRAM; DYNAMIC_BUFFER frees the
+# handshake buffers once the session is idle. Same settings xiaozhi-esp32
+# ships for the ESP32-S3.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
+CONFIG_MBEDTLS_SSL_RENEGOTIATION=n

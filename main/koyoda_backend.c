@@ -517,7 +517,7 @@ static esp_err_t do_ota_checkin(void)
         int status = esp_http_client_get_status_code(client);
         int64_t content_len = esp_http_client_get_content_length(client);
 
-        if (status == 200 && content_len > 0 && content_len < 8192)
+        if (content_len > 0 && content_len < 8192)
         {
             char *resp = (char *)malloc((size_t)content_len + 1);
             if (resp != NULL)
@@ -526,14 +526,26 @@ static esp_err_t do_ota_checkin(void)
                 if (read > 0)
                 {
                     resp[read] = '\0';
-                    result = parse_checkin_response(resp);
+                    if (status == 200)
+                    {
+                        result = parse_checkin_response(resp);
+                    }
+                    else
+                    {
+                        /* Show what the server actually objected to instead
+                         * of just the status code. */
+                        ESP_LOGW(TAG, "Check-in rejected: HTTP %d", status);
+                        ESP_LOGW(TAG, "Server said: %s", resp);
+                        ESP_LOGW(TAG, "Request was: %s", body_str);
+                    }
                 }
                 free(resp);
             }
         }
         else
         {
-            ESP_LOGW(TAG, "OTA check-in HTTP status=%d len=%lld", status, (long long)content_len);
+            ESP_LOGW(TAG, "OTA check-in HTTP status=%d len=%lld (no body)",
+                     status, (long long)content_len);
         }
     }
     else
@@ -543,6 +555,14 @@ static esp_err_t do_ota_checkin(void)
 
     esp_http_client_cleanup(client);
     cJSON_free(body_str);
+
+    /* TLS is the biggest consumer of DMA-capable internal RAM on this
+     * board; report it so a starved LCD is diagnosable from the log. */
+    ESP_LOGI(TAG, "heap after check-in: internal %u B (min %u), psram %u B",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
     return result;
 }
 
