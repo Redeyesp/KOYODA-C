@@ -60,6 +60,7 @@ static const char *TAG = "KOYODA_BACKEND";
 #define BACKEND_MIC_QUEUE_DEPTH   8
 #define BACKEND_MIC_SAMPLES_MAX   256
 #define BACKEND_TICK_MS           500
+#define BACKEND_ACTIVE_TICK_MS    20
 #define BACKEND_OTA_RETRY_MS      (30U * 1000U)
 #define BACKEND_WS_HELLO_TIMEOUT_MS 10000
 
@@ -79,6 +80,18 @@ typedef struct
     uint16_t sample_count;
     int16_t samples[BACKEND_MIC_SAMPLES_MAX];
 } mic_frame_msg_t;
+
+/*
+ * Control events raised by the audio task. The audio owner task must stay
+ * deterministic, so it NEVER calls into the network stack directly -- it
+ * only posts one of these and returns immediately. The backend worker
+ * task is what actually sends them.
+ */
+typedef enum
+{
+    BE_CTRL_LISTEN_START = 0,
+    BE_CTRL_LISTEN_STOP,
+} backend_ctrl_t;
 
 typedef enum
 {
@@ -101,6 +114,7 @@ static char s_ws_url[192] = {0};
 static char s_ws_token[128] = {0};
 
 static QueueHandle_t s_mic_queue = NULL;
+static QueueHandle_t s_ctrl_queue = NULL;
 static uint8_t *s_mic_queue_storage = NULL;
 static StaticQueue_t s_mic_queue_struct;
 static TaskHandle_t s_task = NULL;
@@ -312,7 +326,9 @@ static void send_text(const char *text)
     {
         return;
     }
-    esp_websocket_client_send_text(s_ws, text, (int)strlen(text), portMAX_DELAY);
+    /* Bounded, never portMAX_DELAY: a stalled server must not wedge the
+     * backend worker. Only this task ever sends. */
+    esp_websocket_client_send_text(s_ws, text, (int)strlen(text), pdMS_TO_TICKS(500));
 }
 
 static void send_hello(void)
@@ -568,7 +584,8 @@ static void mic_frame_callback(const int16_t *samples, size_t sample_count, bool
 {
     (void)ctx;
 
-    if (!koyoda_audio_duplex_ai_is_enabled() || !s_channel_open || s_mic_queue == NULL)
+    if (!koyoda_audio_duplex_ai_is_enabled() || !s_channel_open ||
+        s_mic_queue == NULL || s_ctrl_queue == NULL)
     {
         s_prev_vad = false;
         return;
@@ -576,11 +593,13 @@ static void mic_frame_callback(const int16_t *samples, size_t sample_count, bool
 
     if (vad_speaking && !s_prev_vad)
     {
-        send_listen_state("start", "auto");
+        backend_ctrl_t ev = BE_CTRL_LISTEN_START;
+        xQueueSend(s_ctrl_queue, &ev, 0);
     }
     else if (!vad_speaking && s_prev_vad)
     {
-        send_listen_state("stop", NULL);
+        backend_ctrl_t ev = BE_CTRL_LISTEN_STOP;
+        xQueueSend(s_ctrl_queue, &ev, 0);
     }
     s_prev_vad = vad_speaking;
 
@@ -625,8 +644,11 @@ static void backend_task(void *arg)
                 close_ws_channel();
             }
             s_state = wifi_up ? BE_STATE_WIFI_UP : BE_STATE_WIFI_DOWN;
-            /* Drain and discard any mic frames queued while AI was toggling. */
+            /* Drain and discard anything queued while AI was toggling. */
             while (xQueueReceive(s_mic_queue, &msg, 0) == pdTRUE) {}
+            backend_ctrl_t drop;
+            while (xQueueReceive(s_ctrl_queue, &drop, 0) == pdTRUE) {}
+            s_prev_vad = false;
         }
         else if (s_reconnect_requested ||
                  (s_state != BE_STATE_WS_OPEN && s_state != BE_STATE_BACKOFF))
@@ -661,6 +683,22 @@ static void backend_task(void *arg)
             s_state = BE_STATE_WIFI_UP; /* re-enter the branch above next tick */
         }
 
+        /* Send VAD control events raised by the audio task. Doing this
+         * here (not in the callback) keeps the audio owner deterministic. */
+        backend_ctrl_t ev;
+        while (s_channel_open && s_ws != NULL &&
+               xQueueReceive(s_ctrl_queue, &ev, 0) == pdTRUE)
+        {
+            if (ev == BE_CTRL_LISTEN_START)
+            {
+                send_listen_state("start", "auto");
+            }
+            else
+            {
+                send_listen_state("stop", NULL);
+            }
+        }
+
         /* Drain queued mic audio while the channel is open. */
         while (s_channel_open && s_ws != NULL &&
                xQueueReceive(s_mic_queue, &msg, 0) == pdTRUE)
@@ -676,7 +714,10 @@ static void backend_task(void *arg)
                 msg.sample_count * (int)sizeof(int16_t), pdMS_TO_TICKS(200));
         }
 
-        vTaskDelay(pdMS_TO_TICKS(BACKEND_TICK_MS));
+        /* Poll fast while a conversation is live so VAD events and audio
+         * are not delayed by a whole idle tick; idle slowly otherwise. */
+        vTaskDelay(pdMS_TO_TICKS(s_channel_open ? BACKEND_ACTIVE_TICK_MS
+                                                : BACKEND_TICK_MS));
     }
 }
 
@@ -722,6 +763,12 @@ esp_err_t koyoda_backend_start(void)
     }
 
     if (s_mic_queue == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_ctrl_queue = xQueueCreate(8, sizeof(backend_ctrl_t));
+    if (s_ctrl_queue == NULL)
     {
         return ESP_ERR_NO_MEM;
     }
