@@ -1,7 +1,13 @@
 build/
+build-ci/
 managed_components/
 .cache/
 sdkconfig.old
+
+# sdkconfig is generated from sdkconfig.defaults by `idf.py set-target`.
+# CI regenerates it on every run, so it is deliberately not tracked.
+# Put real settings in sdkconfig.defaults, not here.
+sdkconfig
 
 # Never commit the build-time Wi-Fi fallback header (CI generates this
 # transiently from repo secrets and deletes it after every build).

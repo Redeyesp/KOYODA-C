@@ -41,7 +41,7 @@ jobs:
 
           echo
           echo "=== Required files ==="
-          for f in sdkconfig dependencies.lock partitions.csv; do
+          for f in sdkconfig.defaults dependencies.lock partitions.csv; do
             if [ -f "$f" ]; then
               echo "OK      present: $f"
             else
@@ -49,6 +49,9 @@ jobs:
               fail=1
             fi
           done
+          if [ -f sdkconfig ]; then
+            echo "NOTE    a committed sdkconfig exists; CI regenerates it anyway"
+          fi
 
           echo
           echo "=== Commit check ==="
@@ -61,18 +64,23 @@ jobs:
           fi
 
           echo
-          echo "=== Target check ==="
-          if [ -f sdkconfig ]; then
-            if grep -qx 'CONFIG_IDF_TARGET="esp32s3"' sdkconfig; then
-              echo "OK      CONFIG_IDF_TARGET=\"esp32s3\""
-            else
-              echo "BAD     expected CONFIG_IDF_TARGET=\"esp32s3\"; found:"
-              grep -n 'CONFIG_IDF_TARGET' sdkconfig || echo "  (no CONFIG_IDF_TARGET line at all)"
-              echo "  If the line looks right, it may have Windows CRLF endings."
-              fail=1
-            fi
+          echo "=== Build config check (sdkconfig.defaults) ==="
+          if [ -f sdkconfig.defaults ]; then
+            for key in \
+              'CONFIG_PARTITION_TABLE_CUSTOM=y' \
+              'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"' \
+              'CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y' \
+              'CONFIG_SPIRAM=y'
+            do
+              if grep -qxF "$key" sdkconfig.defaults; then
+                echo "OK      $key"
+              else
+                echo "BAD     missing from sdkconfig.defaults: $key"
+                fail=1
+              fi
+            done
           else
-            echo "SKIPPED (sdkconfig missing)"
+            echo "SKIPPED (sdkconfig.defaults missing)"
           fi
 
           echo
@@ -184,7 +192,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm             --user "$(id -u):$(id -g)"             -e HOME=/tmp/koyoda-idf-home             -e CCACHE_DISABLE=1             -v "$GITHUB_WORKSPACE:/project"             -w /project             espressif/idf:v5.5.4             bash -c 'set -euo pipefail; mkdir -p "$HOME"; idf.py --version; idf.py -B build-ci build'             2>&1 | tee koyoda-build.log
+          docker run --rm             --user "$(id -u):$(id -g)"             -e HOME=/tmp/koyoda-idf-home             -e CCACHE_DISABLE=1             -v "$GITHUB_WORKSPACE:/project"             -w /project             espressif/idf:v5.5.4             bash -c 'set -euo pipefail; mkdir -p "$HOME"; idf.py --version; idf.py -B build-ci set-target esp32s3; grep -n "^CONFIG_IDF_TARGET=" sdkconfig; idf.py -B build-ci build'             2>&1 | tee koyoda-build.log
 
       - name: Remove private Wi-Fi build header
         if: always()
