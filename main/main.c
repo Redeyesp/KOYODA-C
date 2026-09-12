@@ -17,7 +17,7 @@
 #include "koyoda_animation.h"
 #include "koyoda_wifi.h"
 #include "koyoda_audio_duplex.h"
-#include "koyoda_audio_stream.h"
+#include "koyoda_backend.h"
 #include "koyoda_face_state.h"
 #include "koyoda_ai_overlays.h"
 #include "koyoda_charge_composite.h"
