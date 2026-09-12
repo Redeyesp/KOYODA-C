@@ -11,6 +11,7 @@
 
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
@@ -130,6 +131,7 @@ static bool s_activation_pending = false;
 static char s_activation_code[32] = {0};
 static char s_activation_message[128] = {0};
 static uint32_t s_flash_size = 0;
+static bool s_identity_ready = false;
 
 static QueueHandle_t s_mic_queue = NULL;
 static QueueHandle_t s_ctrl_queue = NULL;
@@ -171,30 +173,60 @@ static bool s_echo_active = false;
 /* xiaozhi-esp32's SystemInfo::GetMacAddress() / Board::GetUuid().          */
 /* ------------------------------------------------------------------------- */
 
-static void load_or_create_identity(void)
+/*
+ * Resolve the device identity. Deliberately lazy: koyoda_backend_start()
+ * runs immediately after koyoda_wifi_start(), which performs
+ * esp_wifi_init() and nvs_flash_init() inside its own worker task.
+ * Reading identity at start therefore saw an uninitialised Wi-Fi stack
+ * (MAC 00:00:00:00:00:00) and an unopenable NVS, and the server rejected
+ * the check-in with "Invalid client ID".
+ *
+ * Returns false if the identity still cannot be trusted, so the caller
+ * retries later instead of sending a bogus check-in.
+ */
+static bool ensure_identity(void)
 {
+    if (s_identity_ready)
+    {
+        return true;
+    }
+
+    uint8_t mac[6] = {0};
+    /* esp_read_mac() reads eFuse and works whether or not the Wi-Fi
+     * driver has started, unlike esp_wifi_get_mac(). */
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK ||
+        (mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]) == 0)
+    {
+        ESP_LOGW(TAG, "MAC not available yet; deferring identity");
+        return false;
+    }
+
+    snprintf(s_mac_str, sizeof(s_mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
     if (esp_flash_get_size(NULL, &s_flash_size) != ESP_OK)
     {
         s_flash_size = 0;
     }
 
-    uint8_t mac[6] = {0};
-    esp_wifi_get_mac(WIFI_IF_STA, mac);
-    snprintf(s_mac_str, sizeof(s_mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
     nvs_handle_t handle;
-    if (nvs_open(BACKEND_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK)
-    {
-        /* Fall back to a MAC-derived id for this boot only. */
-        snprintf(s_uuid, sizeof(s_uuid), "koyoda-%02x%02x%02x%02x%02x%02x",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-        return;
-    }
+    bool have_nvs =
+        (nvs_open(BACKEND_NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK);
 
     size_t len = sizeof(s_uuid);
-    if (nvs_get_str(handle, BACKEND_NVS_UUID_KEY, s_uuid, &len) != ESP_OK)
+    bool have_uuid =
+        have_nvs &&
+        (nvs_get_str(handle, BACKEND_NVS_UUID_KEY, s_uuid, &len) == ESP_OK) &&
+        (s_uuid[0] != '\0');
+
+    if (!have_uuid)
     {
+        /*
+         * Always a proper RFC 4122 v4 UUID. The previous MAC-derived
+         * fallback ("koyoda-aabbccddeeff") is not a UUID at all and the
+         * server refuses it, so generate a real one even when NVS is
+         * unavailable -- it simply will not survive a reboot then.
+         */
         uint8_t r[16];
         esp_fill_random(r, sizeof(r));
         r[6] = (r[6] & 0x0F) | 0x40; /* version 4 */
@@ -203,25 +235,36 @@ static void load_or_create_identity(void)
                  "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
                  r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
                  r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]);
-        nvs_set_str(handle, BACKEND_NVS_UUID_KEY, s_uuid);
-        nvs_commit(handle);
+
+        if (have_nvs)
+        {
+            nvs_set_str(handle, BACKEND_NVS_UUID_KEY, s_uuid);
+            nvs_commit(handle);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "NVS unavailable; UUID will not persist");
+        }
     }
 
-    /* Reuse a previously learned websocket target so KOYODA can open the
-     * audio channel again even if a later OTA check-in fails (e.g. no
-     * internet route to the OTA host but the LAN media server is fine). */
-    len = sizeof(s_ws_url);
-    nvs_get_str(handle, BACKEND_NVS_WS_URL_KEY, s_ws_url, &len);
-    len = sizeof(s_ws_token);
-    nvs_get_str(handle, BACKEND_NVS_WS_TOK_KEY, s_ws_token, &len);
-    int32_t stored_ver = 0;
-    if (nvs_get_i32(handle, BACKEND_NVS_WS_VER_KEY, &stored_ver) == ESP_OK &&
-        stored_ver != 0)
+    if (have_nvs)
     {
-        s_ws_version = (int)stored_ver;
+        len = sizeof(s_ws_url);
+        nvs_get_str(handle, BACKEND_NVS_WS_URL_KEY, s_ws_url, &len);
+        len = sizeof(s_ws_token);
+        nvs_get_str(handle, BACKEND_NVS_WS_TOK_KEY, s_ws_token, &len);
+        int32_t stored_ver = 0;
+        if (nvs_get_i32(handle, BACKEND_NVS_WS_VER_KEY, &stored_ver) == ESP_OK &&
+            stored_ver != 0)
+        {
+            s_ws_version = (int)stored_ver;
+        }
+        nvs_close(handle);
     }
 
-    nvs_close(handle);
+    s_identity_ready = true;
+    ESP_LOGI(TAG, "Device identity: mac=%s uuid=%s", s_mac_str, s_uuid);
+    return true;
 }
 
 static void save_ws_target(const char *url, const char *token, int version)
@@ -415,6 +458,11 @@ static esp_err_t parse_checkin_response(const char *json)
 
 static esp_err_t do_ota_checkin(void)
 {
+    if (!ensure_identity())
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     const esp_app_desc_t *app_desc = esp_app_get_description();
 
     /*
@@ -1237,7 +1285,6 @@ esp_err_t koyoda_backend_start(void)
     (void)koyoda_codec_selftest_run();
 #endif
 
-    load_or_create_identity();
 
     s_events = xEventGroupCreate();
     if (s_events == NULL)
@@ -1299,6 +1346,11 @@ esp_err_t koyoda_backend_start(void)
     }
 
     ESP_LOGI(TAG, "Xiaozhi backend foundation ready; OTA URL=%s", CONFIG_KOYODA_OTA_URL);
+    ESP_LOGI(TAG,
+             "heap at boot: internal %u B free (largest DMA block %u B), psram %u B",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     return ESP_OK;
 }
 
