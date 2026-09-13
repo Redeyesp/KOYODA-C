@@ -107,7 +107,28 @@ typedef enum
 {
     BE_CTRL_LISTEN_START = 0,
     BE_CTRL_LISTEN_STOP,
+    BE_CTRL_TTS_START,
+    BE_CTRL_TTS_STOP,
+    BE_CTRL_STT_TEXT,
 } backend_ctrl_t;
+
+/*
+ * One inbound Opus packet, copied out of the websocket receive buffer.
+ *
+ * The websocket client's own task must not decode audio: at protocol
+ * version 1 a 60 ms frame is only a few hundred bytes, but Opus decode
+ * plus resampling on top of a TLS session overflows that task's stack.
+ * The handler copies the packet here and returns immediately; the backend
+ * worker task does the decoding, exactly like the mic path.
+ */
+#define BACKEND_PKT_MAX_BYTES   512
+#define BACKEND_PKT_QUEUE_DEPTH 12
+
+typedef struct
+{
+    uint16_t len;
+    uint8_t data[BACKEND_PKT_MAX_BYTES];
+} audio_pkt_msg_t;
 
 typedef enum
 {
@@ -137,6 +158,10 @@ static bool s_identity_ready = false;
 
 static QueueHandle_t s_mic_queue = NULL;
 static QueueHandle_t s_ctrl_queue = NULL;
+static QueueHandle_t s_pkt_queue = NULL;
+static uint8_t *s_pkt_queue_storage = NULL;
+static StaticQueue_t s_pkt_queue_struct;
+static volatile uint32_t s_pkt_dropped = 0;
 static uint8_t *s_mic_queue_storage = NULL;
 static StaticQueue_t s_mic_queue_struct;
 static TaskHandle_t s_task = NULL;
@@ -766,20 +791,23 @@ static void handle_incoming_json(const char *data, int len)
             cJSON *state = cJSON_GetObjectItem(root, "state");
             if (cJSON_IsString(state))
             {
+                /* Only post an event: playback start/stop takes the audio
+                 * owner's lock and must not run on the websocket task. */
+                backend_ctrl_t ev;
+                bool have = false;
                 if (strcmp(state->valuestring, "start") == 0)
                 {
-                    s_playback_active = true;
-                    koyoda_audio_duplex_playback_start();
-                    koyoda_face_state_set(KOYODA_FACE_AI_SPEAKING);
+                    ev = BE_CTRL_TTS_START;
+                    have = true;
                 }
                 else if (strcmp(state->valuestring, "stop") == 0)
                 {
-                    if (s_playback_active)
-                    {
-                        koyoda_audio_duplex_playback_end();
-                        s_playback_active = false;
-                    }
-                    koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
+                    ev = BE_CTRL_TTS_STOP;
+                    have = true;
+                }
+                if (have && s_ctrl_queue != NULL)
+                {
+                    xQueueSend(s_ctrl_queue, &ev, 0);
                 }
             }
         }
@@ -790,7 +818,11 @@ static void handle_incoming_json(const char *data, int len)
             {
                 ESP_LOGI(TAG, "STT: %s", text->valuestring);
             }
-            koyoda_face_state_set(KOYODA_FACE_AI_THINKING);
+            backend_ctrl_t ev = BE_CTRL_STT_TEXT;
+            if (s_ctrl_queue != NULL)
+            {
+                xQueueSend(s_ctrl_queue, &ev, 0);
+            }
         }
     }
 
@@ -836,20 +868,26 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
         }
         else if (data->op_code == 0x2 /* binary */)
         {
-            /* Protocol version 1: the payload is a bare Opus packet. */
-            if (s_playback_active && data->data_len > 0 && koyoda_codec_is_open())
+            /*
+             * Protocol version 1: the payload is a bare Opus packet.
+             * Copy and hand off; decoding here would overflow this task.
+             */
+            if (s_playback_active && s_pkt_queue != NULL &&
+                data->data_len <= BACKEND_PKT_MAX_BYTES)
             {
-                size_t pcm_samples = 0;
-                if (koyoda_codec_decode(
-                        (const uint8_t *)data->data_ptr,
-                        (size_t)data->data_len,
-                        s_playback_pcm,
-                        KOYODA_CODEC_MAX_PCM_OUT,
-                        &pcm_samples) == ESP_OK &&
-                    pcm_samples > 0)
+                audio_pkt_msg_t pkt;
+                pkt.len = (uint16_t)data->data_len;
+                memcpy(pkt.data, data->data_ptr, pkt.len);
+                if (xQueueSend(s_pkt_queue, &pkt, 0) != pdTRUE)
                 {
-                    koyoda_audio_duplex_playback_write(s_playback_pcm, pcm_samples);
+                    /* Worker is behind; drop rather than stall the socket. */
+                    s_pkt_dropped++;
                 }
+            }
+            else if (data->data_len > BACKEND_PKT_MAX_BYTES)
+            {
+                ESP_LOGW(TAG, "Dropping oversized audio frame (%d bytes)",
+                         data->data_len);
             }
         }
         break;
@@ -857,13 +895,10 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
     case WEBSOCKET_EVENT_DISCONNECTED:
     case WEBSOCKET_EVENT_ERROR:
         ESP_LOGW(TAG, "WebSocket disconnected/error");
+        /* Only flip flags here. Ending playback takes the audio owner's
+         * lock and must not run on this task; the worker notices
+         * s_channel_open going false and cleans up. */
         s_channel_open = false;
-        if (s_playback_active)
-        {
-            koyoda_audio_duplex_playback_end();
-            s_playback_active = false;
-        }
-        koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
         break;
 
     default:
@@ -1001,7 +1036,14 @@ static void close_ws_channel(void)
         s_ws = NULL;
     }
     s_channel_open = false;
-    s_playback_active = false;
+
+    /* Runs on the worker task, so taking the audio lock here is safe. */
+    if (s_playback_active)
+    {
+        koyoda_audio_duplex_playback_end();
+        s_playback_active = false;
+    }
+    koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
 
     /* Give the codec's tens of KB back so an idle pet holds none of it. */
     koyoda_codec_close();
@@ -1224,6 +1266,11 @@ static void backend_task(void *arg)
             while (xQueueReceive(s_mic_queue, &msg, 0) == pdTRUE) {}
             backend_ctrl_t drop;
             while (xQueueReceive(s_ctrl_queue, &drop, 0) == pdTRUE) {}
+            if (s_pkt_queue != NULL)
+            {
+                static audio_pkt_msg_t scratch;
+                while (xQueueReceive(s_pkt_queue, &scratch, 0) == pdTRUE) {}
+            }
             s_prev_vad = false;
         }
         else if (s_reconnect_requested ||
@@ -1259,21 +1306,77 @@ static void backend_task(void *arg)
             s_state = BE_STATE_WIFI_UP; /* re-enter the branch above next tick */
         }
 
-        /* Send VAD control events raised by the audio task. Doing this
-         * here (not in the callback) keeps the audio owner deterministic. */
+        /* Control events raised by the audio task and the websocket task.
+         * Everything that blocks or costs stack happens here, not on
+         * those tasks. */
         backend_ctrl_t ev;
         while (s_channel_open && s_ws != NULL &&
                xQueueReceive(s_ctrl_queue, &ev, 0) == pdTRUE)
         {
-            if (ev == BE_CTRL_LISTEN_START)
+            switch (ev)
             {
+            case BE_CTRL_LISTEN_START:
                 send_listen_state("start", "auto");
-            }
-            else
-            {
+                break;
+
+            case BE_CTRL_LISTEN_STOP:
                 send_listen_state("stop", NULL);
-                /* Drop any partial frame so the next utterance starts clean. */
                 koyoda_codec_encode_reset();
+                break;
+
+            case BE_CTRL_TTS_START:
+                if (!s_playback_active &&
+                    koyoda_audio_duplex_playback_start() == ESP_OK)
+                {
+                    s_playback_active = true;
+                    koyoda_face_state_set(KOYODA_FACE_AI_SPEAKING);
+                }
+                break;
+
+            case BE_CTRL_TTS_STOP:
+                if (s_playback_active)
+                {
+                    koyoda_audio_duplex_playback_end();
+                    s_playback_active = false;
+                }
+                koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
+                break;
+
+            case BE_CTRL_STT_TEXT:
+                koyoda_face_state_set(KOYODA_FACE_AI_THINKING);
+                break;
+
+            default:
+                break;
+            }
+        }
+
+        /* Decode inbound Opus and feed the speaker. */
+        if (s_channel_open && s_playback_pcm != NULL)
+        {
+            audio_pkt_msg_t pkt;
+            while (xQueueReceive(s_pkt_queue, &pkt, 0) == pdTRUE)
+            {
+                if (!s_playback_active || !koyoda_codec_is_open())
+                {
+                    continue;
+                }
+                size_t pcm_samples = 0;
+                if (koyoda_codec_decode(pkt.data, pkt.len,
+                                        s_playback_pcm,
+                                        KOYODA_CODEC_MAX_PCM_OUT,
+                                        &pcm_samples) == ESP_OK &&
+                    pcm_samples > 0)
+                {
+                    koyoda_audio_duplex_playback_write(s_playback_pcm, pcm_samples);
+                }
+            }
+
+            if (s_pkt_dropped != 0)
+            {
+                ESP_LOGW(TAG, "Dropped %u audio packets (worker behind)",
+                         (unsigned)s_pkt_dropped);
+                s_pkt_dropped = 0;
             }
         }
 
@@ -1345,8 +1448,27 @@ esp_err_t koyoda_backend_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    s_ctrl_queue = xQueueCreate(8, sizeof(backend_ctrl_t));
+    s_ctrl_queue = xQueueCreate(12, sizeof(backend_ctrl_t));
     if (s_ctrl_queue == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Inbound audio packets, PSRAM-backed like the mic queue so the LCD
+     * keeps its DMA-capable internal RAM. */
+    s_pkt_queue_storage = heap_caps_malloc(
+        BACKEND_PKT_QUEUE_DEPTH * sizeof(audio_pkt_msg_t), MALLOC_CAP_SPIRAM);
+    if (s_pkt_queue_storage != NULL)
+    {
+        s_pkt_queue = xQueueCreateStatic(
+            BACKEND_PKT_QUEUE_DEPTH, sizeof(audio_pkt_msg_t),
+            s_pkt_queue_storage, &s_pkt_queue_struct);
+    }
+    else
+    {
+        s_pkt_queue = xQueueCreate(BACKEND_PKT_QUEUE_DEPTH, sizeof(audio_pkt_msg_t));
+    }
+    if (s_pkt_queue == NULL)
     {
         return ESP_ERR_NO_MEM;
     }
