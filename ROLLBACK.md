@@ -116,7 +116,7 @@ git push
 | `MBEDTLS_EXTERNAL_MEM_ALLOC` | **y** | off puts TLS back in internal RAM |
 | `KOYODA_ECHO_TEST` | **n** | y disables the network backend entirely |
 | `KOYODA_CODEC_SELFTEST` | **n** | y only adds ~1 s to boot |
-| `KOYODA_MIC_ANALOG_GAIN_DB` | **33** (24 = original) | ES7210 rounds to 3 dB steps, so 33 lands on 30 |
+| `KOYODA_MIC_ANALOG_GAIN_DB` | **33** (24 = original) | rounds to 30 on the 3 dB grid. 36 was tried and measured WORSE: SNR fell from 17.1 to 14.7 dB because the mic's own noise scales with gain. Judge changes by SNR (speech avg / noise floor), not by peak level |
 | `KOYODA_MIC_DIGITAL_GAIN_X10` | **20** (10 = off) | at 10 the code is removed by the preprocessor |
 | `NEWLIB_NANO_FORMAT` | **y** | saves RAM but has no `%lld`/`%llu`; use `%lu`/`%d` |
 

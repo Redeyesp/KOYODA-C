@@ -60,10 +60,16 @@ CONFIG_NEWLIB_NANO_FORMAT=y
 # which regenerates sdkconfig from this file on every build, and sdkconfig
 # is gitignored. A local menuconfig change is silently discarded by CI.
 #
-# 36 rather than 33 because the ES7210 quantises to 3 dB steps: 33 was
-# rounded down to 30, which is why the measured gain was 2.0x instead of
-# the expected 2.8x.
-CONFIG_KOYODA_MIC_ANALOG_GAIN_DB=36
+# Measured SNR (speech avg / noise floor) at three settings:
+#   24 dB -> 101/14 = 17.2 dB     (original)
+#   33 dB -> 200/28 = 17.1 dB     (rounds to 30 on the 3 dB grid)
+#   36 dB -> 300/55 = 14.7 dB     (worse, and STT accuracy dropped)
+#
+# The ES7210's own noise scales with gain, so past ~30 dB nothing is
+# gained and the encoder just receives louder noise. 33 keeps the higher
+# signal level for Opus without losing SNR. Do not raise this again
+# without measuring SNR, not just the peak value.
+CONFIG_KOYODA_MIC_ANALOG_GAIN_DB=33
 CONFIG_KOYODA_MIC_DIGITAL_GAIN_X10=20
 
 # Keep LCD SPI queue shallow so PSRAM-backed LVGL flushes do not exhaust
