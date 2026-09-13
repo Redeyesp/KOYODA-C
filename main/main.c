@@ -445,7 +445,6 @@ static const char KOYODA_WIFI_PAIR_TEXT[] =
     "Pair your phone with\n"
     KOYODA_WIFI_SETUP_AP_SSID "\n"
     "Password: " KOYODA_WIFI_SETUP_AP_PASSWORD "\n"
-    "\n"
     "Then open\n"
     KOYODA_WIFI_SETUP_AP_URL "\n"
     "to choose your Wi-Fi";
@@ -477,8 +476,13 @@ static void set_wifi_bars_visible_locked(bool visible)
     }
 }
 
-/* Instructions need the middle of the screen; the connected view keeps the
- * original compact layout under the bars. */
+/*
+ * The instruction block is ~128 px tall and has to sit in the middle of a
+ * 466 px round screen. Centring it at y=0 makes it span roughly -64..+64,
+ * which collides with the status label's normal y=70 spot, so the status
+ * label moves up to y=-125 in this mode. That keeps 27 px clear of the
+ * title above and 83 px clear of the button below.
+ */
 static void set_wifi_detail_layout_locked(bool instructions)
 {
     if (wifi_detail_label == NULL)
@@ -486,11 +490,16 @@ static void set_wifi_detail_layout_locked(bool instructions)
         return;
     }
 
-    lv_obj_align(wifi_detail_label, LV_ALIGN_CENTER, 0, instructions ? 10 : 102);
+    lv_obj_align(wifi_detail_label, LV_ALIGN_CENTER, 0, instructions ? 0 : 102);
     lv_obj_set_style_text_color(
         wifi_detail_label,
         instructions ? lv_color_hex(0xE6E6E6) : lv_color_hex(0xFFFFFF),
         0);
+
+    if (wifi_status_label != NULL)
+    {
+        lv_obj_align(wifi_status_label, LV_ALIGN_CENTER, 0, instructions ? -125 : 70);
+    }
 
     if (wifi_rssi_label != NULL)
     {
