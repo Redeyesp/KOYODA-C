@@ -15,11 +15,16 @@ static const char *TAG = "KOYODA_CODEC";
 
 /* Accumulator must hold at least one full Opus frame plus one resampled
  * input block of slack before it is drained. */
-#define ENC_ACC_CAPACITY (KOYODA_OPUS_FRAME_SAMPLES * 2)
+/* Accumulator capacity is computed at open() from the encoder-reported
+ * frame size; see s_enc_acc_capacity. */
 
-/* Encoded Opus output for a 60 ms mono frame is well under this; the
- * encoder also reports its own required size and we take the larger. */
-#define ENC_OUT_FALLBACK 512
+/*
+ * Hard floor for the encoder output buffer. RFC 6716 allows a mono Opus
+ * packet up to 1275 bytes; the nominal size the library reports is much
+ * smaller and is NOT a guaranteed maximum. Plus slack so a library that
+ * writes a few extra bytes still cannot reach neighbouring allocations.
+ */
+#define ENC_OUT_MAX_OPUS 1500
 
 /* Scratch for one resampled input block. The backend feeds 256-sample
  * blocks, which shrink to ~186 at 16 kHz, but allow generous headroom. */
@@ -32,9 +37,11 @@ static void *s_out_resampler = NULL;  /* 16000 -> 22050 */
 
 static int16_t *s_enc_acc = NULL;     /* 16 kHz PCM awaiting a full frame */
 static size_t s_enc_acc_len = 0;
+static size_t s_enc_acc_capacity = 0;
 static int16_t *s_resamp_scratch = NULL;
 static uint8_t *s_enc_out = NULL;
 static size_t s_enc_out_size = 0;
+static size_t s_enc_frame_samples = KOYODA_OPUS_FRAME_SAMPLES;
 static int16_t *s_dec_pcm16k = NULL;  /* decoder output before resampling */
 
 static bool s_open = false;
@@ -73,6 +80,7 @@ static void free_all(void)
 
     s_enc_acc_len = 0;
     s_enc_out_size = 0;
+    s_enc_acc_capacity = 0;
 }
 
 /* Prefer PSRAM for the bulk buffers: internal RAM on this board is shared
@@ -118,7 +126,35 @@ esp_err_t koyoda_codec_open(void)
     int enc_in_size = 0;
     int enc_out_size = 0;
     esp_opus_enc_get_frame_size(s_encoder, &enc_in_size, &enc_out_size);
-    s_enc_out_size = (enc_out_size > 0) ? (size_t)enc_out_size : ENC_OUT_FALLBACK;
+
+    /*
+     * Frame size comes from the encoder, not from our own arithmetic.
+     * Assuming 960 samples silently breaks if the library disagrees.
+     */
+    if (enc_in_size > 0)
+    {
+        s_enc_frame_samples = (size_t)enc_in_size / sizeof(int16_t);
+    }
+    else
+    {
+        s_enc_frame_samples = KOYODA_OPUS_FRAME_SAMPLES;
+    }
+
+    /*
+     * CRITICAL: do not trust the reported output size as a hard cap.
+     * esp_opus_enc_get_frame_size() reports a nominal size (227 bytes at
+     * our settings), but Opus VBR can emit up to ~1275 bytes for a mono
+     * frame. Allocating only the nominal size lets a loud or complex
+     * frame write past the buffer and corrupt the heap -- which shows up
+     * later as an unrelated crash in malloc/queue code.
+     */
+    size_t reported = (enc_out_size > 0) ? (size_t)enc_out_size : 0;
+    s_enc_out_size = (reported > ENC_OUT_MAX_OPUS) ? reported : ENC_OUT_MAX_OPUS;
+
+    ESP_LOGI(TAG,
+             "Opus encoder: in %d B (%u samples), out nominal %d B, allocating %u B",
+             enc_in_size, (unsigned)s_enc_frame_samples,
+             enc_out_size, (unsigned)s_enc_out_size);
 
     /* ---- Opus decoder: decode at 16 kHz, resample to 22050 after ----
      * 22050 is not a valid Opus rate, so unlike xiaozhi (whose codecs run
@@ -171,7 +207,8 @@ esp_err_t koyoda_codec_open(void)
     }
 
     /* ---- Buffers ---- */
-    s_enc_acc = alloc_pref_psram(ENC_ACC_CAPACITY * sizeof(int16_t));
+    s_enc_acc_capacity = s_enc_frame_samples * 2 + RESAMP_IN_SCRATCH;
+    s_enc_acc = alloc_pref_psram(s_enc_acc_capacity * sizeof(int16_t));
     s_resamp_scratch = alloc_pref_psram(RESAMP_IN_SCRATCH * sizeof(int16_t));
     s_enc_out = alloc_pref_psram(s_enc_out_size);
     s_dec_pcm16k = alloc_pref_psram(KOYODA_OPUS_FRAME_SAMPLES * 2 * sizeof(int16_t));
@@ -257,7 +294,7 @@ esp_err_t koyoda_codec_encode_push(
     size_t consumed = 0;
     while (consumed < produced)
     {
-        size_t space = ENC_ACC_CAPACITY - s_enc_acc_len;
+        size_t space = s_enc_acc_capacity - s_enc_acc_len;
         size_t take = produced - consumed;
         if (take > space)
         {
@@ -268,11 +305,11 @@ esp_err_t koyoda_codec_encode_push(
         s_enc_acc_len += take;
         consumed += take;
 
-        while (s_enc_acc_len >= KOYODA_OPUS_FRAME_SAMPLES)
+        while (s_enc_acc_len >= s_enc_frame_samples)
         {
             esp_audio_enc_in_frame_t in = {
                 .buffer = (uint8_t *)s_enc_acc,
-                .len = (uint32_t)(KOYODA_OPUS_FRAME_SAMPLES * sizeof(int16_t)),
+                .len = (uint32_t)(s_enc_frame_samples * sizeof(int16_t)),
             };
             esp_audio_enc_out_frame_t out = {
                 .buffer = s_enc_out,
@@ -283,7 +320,20 @@ esp_err_t koyoda_codec_encode_push(
             if (esp_opus_enc_process(s_encoder, &in, &out) == ESP_AUDIO_ERR_OK &&
                 out.encoded_bytes > 0)
             {
-                cb(s_enc_out, (size_t)out.encoded_bytes, user_ctx);
+                if ((size_t)out.encoded_bytes > s_enc_out_size)
+                {
+                    /* Should be impossible now that the buffer is sized to
+                     * the Opus maximum, but if it ever happens the heap is
+                     * already damaged and silence is the worst response. */
+                    ESP_LOGE(TAG,
+                             "Opus wrote %u bytes into a %u byte buffer",
+                             (unsigned)out.encoded_bytes,
+                             (unsigned)s_enc_out_size);
+                }
+                else
+                {
+                    cb(s_enc_out, (size_t)out.encoded_bytes, user_ctx);
+                }
             }
             else
             {
@@ -291,10 +341,10 @@ esp_err_t koyoda_codec_encode_push(
             }
 
             /* Shift the remainder down. */
-            size_t leftover = s_enc_acc_len - KOYODA_OPUS_FRAME_SAMPLES;
+            size_t leftover = s_enc_acc_len - s_enc_frame_samples;
             if (leftover > 0)
             {
-                memmove(s_enc_acc, &s_enc_acc[KOYODA_OPUS_FRAME_SAMPLES],
+                memmove(s_enc_acc, &s_enc_acc[s_enc_frame_samples],
                         leftover * sizeof(int16_t));
             }
             s_enc_acc_len = leftover;
