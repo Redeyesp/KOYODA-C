@@ -77,6 +77,9 @@ static const char *TAG = "KOYODA_BACKEND";
 #define BACKEND_TICK_MS           500
 #define BACKEND_ACTIVE_TICK_MS    20
 #define BACKEND_OTA_RETRY_MS      (30U * 1000U)
+/* A dropped channel should come back quickly; 30 s of silence mid-chat
+ * feels broken. The OTA target is already cached so this is cheap. */
+#define BACKEND_RECONNECT_MS      (3U * 1000U)
 #define BACKEND_WS_HELLO_TIMEOUT_MS 10000
 
 /*
@@ -909,7 +912,14 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
 
     case WEBSOCKET_EVENT_DISCONNECTED:
     case WEBSOCKET_EVENT_ERROR:
-        ESP_LOGW(TAG, "WebSocket disconnected/error");
+    case WEBSOCKET_EVENT_CLOSED:
+        /*
+         * CLOSED is the graceful path and is NOT the same event as
+         * DISCONNECTED. Handling only the latter meant a polite server
+         * close went unnoticed: the channel stayed marked open and every
+         * later send logged "Websocket client is not connected" forever.
+         */
+        ESP_LOGW(TAG, "WebSocket closed (event %d)", (int)event_id);
         /* Only flip flags here. Ending playback takes the audio owner's
          * lock and must not run on this task; the worker notices
          * s_channel_open going false and cleans up. */
@@ -1134,8 +1144,11 @@ static void mic_frame_callback(const int16_t *samples, size_t sample_count, bool
 static void opus_packet_ready(const uint8_t *data, size_t len, void *ctx)
 {
     (void)ctx;
-    if (s_ws == NULL || !s_channel_open)
+    if (s_ws == NULL || !s_channel_open ||
+        !esp_websocket_client_is_connected(s_ws))
     {
+        /* Silently drop: without this the library logs one error per
+         * frame and floods the console once a link drops. */
         return;
     }
     esp_websocket_client_send_bin(
@@ -1322,6 +1335,21 @@ static void backend_task(void *arg)
                     s_backoff_until_ms = now_ms + BACKEND_OTA_RETRY_MS;
                 }
             }
+        }
+        else if (s_state == BE_STATE_WS_OPEN &&
+                 (!s_channel_open || s_ws == NULL ||
+                  !esp_websocket_client_is_connected(s_ws)))
+        {
+            /*
+             * The channel died under us: the server closed it, the socket
+             * dropped, or the link went away. Without this branch the
+             * state machine stayed in WS_OPEN forever and never retried,
+             * so KOYODA looked connected but silently stopped talking.
+             */
+            ESP_LOGW(TAG, "Channel lost; will reconnect");
+            close_ws_channel();
+            s_state = BE_STATE_BACKOFF;
+            s_backoff_until_ms = now_ms + BACKEND_RECONNECT_MS;
         }
         else if (s_state == BE_STATE_BACKOFF && (int32_t)(now_ms - s_backoff_until_ms) >= 0)
         {
