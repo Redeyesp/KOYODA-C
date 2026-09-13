@@ -72,3 +72,32 @@ config KOYODA_ECHO_TEST
         connect to any backend while this is enabled.
 
 endmenu
+
+menu "KOYODA Display Memory"
+
+config KOYODA_SMALL_DRAW_BUFFER
+    bool "Use a small DMA-capable LVGL draw buffer"
+    default y
+    help
+        The display adapter defaults to a full-screen draw buffer in
+        PSRAM. PSRAM cannot do DMA, so every flush forces spi_master to
+        allocate a temporary DMA buffer from internal RAM -- the same
+        pool the Opus codec and TLS need. When it runs out the display
+        fails with "Failed to allocate priv TX buffer" and the face
+        freezes or tears.
+
+        Enabling this replaces it with a small buffer already in
+        DMA-capable internal RAM, so no temporary allocation is needed
+        at all. Turn off only to compare against the stock behaviour.
+
+config KOYODA_DRAW_BUFFER_LINES
+    int "Draw buffer height in lines"
+    depends on KOYODA_SMALL_DRAW_BUFFER
+    range 8 120
+    default 24
+    help
+        Buffer size is 466 * lines * 2 bytes. 24 lines costs about
+        22 KB. More lines means fewer, larger flushes (slightly faster)
+        but takes more internal RAM away from the codec.
+
+endmenu

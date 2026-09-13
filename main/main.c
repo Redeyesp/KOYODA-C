@@ -7,6 +7,7 @@
 #include "esp_log.h"
 
 #include "lvgl.h"
+#include "esp_heap_caps.h"
 
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
@@ -1761,11 +1762,54 @@ void app_main(void)
     display_cfg.lv_adapter_cfg.task_core_id = 0;
 
     ESP_LOGI(TAG, "Starting LVGL adapter pinned to CPU0");
-    if (bsp_display_start_with_config(&display_cfg) == NULL)
+    lv_display_t *koyoda_disp = bsp_display_start_with_config(&display_cfg);
+    if (koyoda_disp == NULL)
     {
         ESP_LOGE(TAG, "Display/LVGL start failed");
         return;
     }
+
+#if CONFIG_KOYODA_SMALL_DRAW_BUFFER
+    /*
+     * Replace the adapter's default draw buffer.
+     *
+     * On this board the adapter defaults to a FULL-SCREEN buffer in PSRAM
+     * (466x466x2 = 434 KB). PSRAM is not DMA-capable, so every flush makes
+     * spi_master allocate a temporary DMA buffer out of internal RAM. That
+     * pool is also what the Opus codec and TLS need, so the two fight and
+     * the loser is the display:
+     *   "setup_dma_priv_buffer: Failed to allocate priv TX buffer"
+     *   "Draw bitmap failed: ESP_ERR_NO_MEM"
+     *
+     * A small buffer that is ALREADY DMA-capable internal RAM removes the
+     * temporary allocation entirely: the cost becomes a fixed, predictable
+     * block instead of an unbounded per-flush request. LVGL just does more
+     * smaller flushes, which this panel handles fine.
+     */
+    {
+        const size_t lines = CONFIG_KOYODA_DRAW_BUFFER_LINES;
+        const size_t buf_bytes = (size_t)466 * lines * 2; /* RGB565 */
+
+        void *draw_buf = heap_caps_malloc(buf_bytes,
+                                          MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (draw_buf == NULL)
+        {
+            ESP_LOGW(TAG,
+                     "Small draw buffer (%u B) unavailable; keeping adapter default",
+                     (unsigned)buf_bytes);
+        }
+        else
+        {
+            bsp_display_lock(-1);
+            lv_display_set_buffers(koyoda_disp, draw_buf, NULL, buf_bytes,
+                                   LV_DISPLAY_RENDER_MODE_PARTIAL);
+            bsp_display_unlock();
+            ESP_LOGI(TAG,
+                     "LVGL draw buffer: %u lines, %u B in internal DMA RAM",
+                     (unsigned)lines, (unsigned)buf_bytes);
+        }
+    }
+#endif
 
     if (pmu_bridge_init() != 0)
     {
