@@ -433,6 +433,78 @@ static void create_battery_page(lv_obj_t *screen)
  * existing background Wi-Fi module.
  * ========================================================= */
 
+/*
+ * Setup instructions, assembled at compile time from the same macros the
+ * Wi-Fi module uses, so the SSID/password/URL on screen can never drift
+ * from what the hotspot actually is.
+ *
+ * These are string literals passed to lv_label_set_text_static(), which
+ * keeps only the pointer -- no heap copy, which matters on this board.
+ */
+static const char KOYODA_WIFI_PAIR_TEXT[] =
+    "Pair your phone with\n"
+    KOYODA_WIFI_SETUP_AP_SSID "\n"
+    "Password: " KOYODA_WIFI_SETUP_AP_PASSWORD "\n"
+    "\n"
+    "Then open\n"
+    KOYODA_WIFI_SETUP_AP_URL "\n"
+    "to choose your Wi-Fi";
+
+static const char KOYODA_WIFI_IDLE_TEXT[] =
+    "Not connected\n"
+    "\n"
+    "Tap SET UP WI-FI below\n"
+    "to start the hotspot";
+
+/* The four-bar meter is meaningless without a connection, so it is hidden
+ * rather than drawn as four dead grey blocks. */
+static void set_wifi_bars_visible_locked(bool visible)
+{
+    for (int i = 0; i < 4; ++i)
+    {
+        if (wifi_signal_bars[i] == NULL)
+        {
+            continue;
+        }
+        if (visible)
+        {
+            lv_obj_clear_flag(wifi_signal_bars[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        else
+        {
+            lv_obj_add_flag(wifi_signal_bars[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+/* Instructions need the middle of the screen; the connected view keeps the
+ * original compact layout under the bars. */
+static void set_wifi_detail_layout_locked(bool instructions)
+{
+    if (wifi_detail_label == NULL)
+    {
+        return;
+    }
+
+    lv_obj_align(wifi_detail_label, LV_ALIGN_CENTER, 0, instructions ? 10 : 102);
+    lv_obj_set_style_text_color(
+        wifi_detail_label,
+        instructions ? lv_color_hex(0xE6E6E6) : lv_color_hex(0xFFFFFF),
+        0);
+
+    if (wifi_rssi_label != NULL)
+    {
+        if (instructions)
+        {
+            lv_obj_add_flag(wifi_rssi_label, LV_OBJ_FLAG_HIDDEN);
+        }
+        else
+        {
+            lv_obj_clear_flag(wifi_rssi_label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
 static void set_wifi_bar_level_locked(int bars)
 {
     for (int i = 0; i < 4; ++i)
@@ -463,35 +535,36 @@ static void update_wifi_ui_locked(void)
 
     if (provisioning)
     {
-        set_wifi_bar_level_locked(0);
+        set_wifi_bars_visible_locked(false);
+        set_wifi_detail_layout_locked(true);
 
         if (setup_state == KOYODA_WIFI_SETUP_TESTING)
         {
             lv_label_set_text(wifi_status_label, "TESTING...");
             lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0xFFD166), 0);
-            lv_label_set_text(wifi_detail_label, "Trying new Wi-Fi");
-            lv_label_set_text(wifi_rssi_label, "Keep phone connected");
+            lv_label_set_text_static(
+                wifi_detail_label,
+                "Trying your Wi-Fi\n\nKeep your phone\nconnected to KOYODA");
         }
         else if (setup_state == KOYODA_WIFI_SETUP_FAILED)
         {
             lv_label_set_text(wifi_status_label, "TRY AGAIN");
             lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0xFF7FA3), 0);
-            lv_label_set_text(wifi_detail_label, "Join KOYODA-Setup");
-            lv_label_set_text(wifi_rssi_label, "PW: koyoda88");
+            lv_label_set_text_static(wifi_detail_label, KOYODA_WIFI_PAIR_TEXT);
         }
         else if (setup_state == KOYODA_WIFI_SETUP_SUCCESS)
         {
             lv_label_set_text(wifi_status_label, "SAVED");
             lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0x00D5D5), 0);
-            lv_label_set_text(wifi_detail_label, "New Wi-Fi connected");
-            lv_label_set_text(wifi_rssi_label, "Setup closing...");
+            lv_label_set_text_static(
+                wifi_detail_label,
+                "New Wi-Fi connected\n\nSetup closing...");
         }
         else
         {
             lv_label_set_text(wifi_status_label, "SETUP MODE");
             lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0x00D5D5), 0);
-            lv_label_set_text(wifi_detail_label, "Join KOYODA-Setup");
-            lv_label_set_text(wifi_rssi_label, "PW: koyoda88");
+            lv_label_set_text_static(wifi_detail_label, KOYODA_WIFI_PAIR_TEXT);
         }
 
         if (wifi_change_button_label != NULL)
@@ -503,28 +576,27 @@ static void update_wifi_ui_locked(void)
 
     if (wifi_change_button_label != NULL)
     {
-        lv_label_set_text(wifi_change_button_label, "CHANGE WI-FI");
+        /* "CHANGE" only makes sense when there is something to change. */
+        lv_label_set_text(wifi_change_button_label,
+                          connected ? "CHANGE WI-FI" : "SET UP WI-FI");
     }
 
     if (!connected)
     {
-        lv_label_set_text(wifi_status_label, "CONNECTING...");
+        lv_label_set_text(wifi_status_label, "NOT CONNECTED");
         lv_obj_set_style_text_color(
             wifi_status_label,
             lv_color_hex(0xFF7FA3),
             0);
 
-        lv_label_set_text(
-            wifi_detail_label,
-            "Waiting for Wi-Fi");
-
-        lv_label_set_text(
-            wifi_rssi_label,
-            "RSSI -- dBm");
-
-        set_wifi_bar_level_locked(0);
+        set_wifi_bars_visible_locked(false);
+        set_wifi_detail_layout_locked(true);
+        lv_label_set_text_static(wifi_detail_label, KOYODA_WIFI_IDLE_TEXT);
         return;
     }
+
+    set_wifi_bars_visible_locked(true);
+    set_wifi_detail_layout_locked(false);
 
     /* Connected becomes true only after DHCP succeeds. */
     lv_label_set_text(wifi_status_label, "CONNECTED");
@@ -667,6 +739,18 @@ static void create_wifi_page(lv_obj_t *screen)
         wifi_detail_label,
         &lv_font_montserrat_14,
         0);
+    /*
+     * Wide enough for the setup instructions but inside the round bezel,
+     * and centred so both the one-line SSID and the multi-line block look
+     * right without creating a second label.
+     *
+     * No lv_label_set_long_mode() call: wrap is already the default, and
+     * the enum was renamed (LV_LABEL_LONG_WRAP -> LV_LABEL_LONG_MODE_WRAP)
+     * in LVGL 9.3, so naming it would tie this file to one LVGL version.
+     */
+    lv_obj_set_width(wifi_detail_label, 330);
+    lv_obj_set_style_text_align(wifi_detail_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(wifi_detail_label, 4, 0);
     lv_obj_align(
         wifi_detail_label,
         LV_ALIGN_CENTER,

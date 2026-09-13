@@ -11,6 +11,8 @@ extern "C" {
 /* Phone provisioning hotspot. Physical access to KOYODA is required to start it. */
 #define KOYODA_WIFI_SETUP_AP_SSID      "KOYODA-Setup"
 #define KOYODA_WIFI_SETUP_AP_PASSWORD  "koyoda88"
+/* Default SoftAP gateway; the captive portal is served here. */
+#define KOYODA_WIFI_SETUP_AP_URL       "http://192.168.4.1"
 
 typedef enum
 {
