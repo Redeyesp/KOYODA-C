@@ -664,9 +664,13 @@ static void service_remote_playback_if_pending(void)
 
     ESP_LOGI(
         TAG,
-        "REMOTE SPEAK END duration=%lums samples=%llu; mic/VAD resumed",
+        /* %llu is not supported by the nano printf enabled in
+         * sdkconfig.defaults (CONFIG_NEWLIB_NANO_FORMAT), which printed a
+         * literal "llu". A playback burst never approaches 2^32 samples,
+         * so %lu is both correct and cheaper. */
+        "REMOTE SPEAK END duration=%lums samples=%lu; mic/VAD resumed",
         (unsigned long)duration_ms,
-        (unsigned long long)total_samples);
+        (unsigned long)total_samples);
 }
 
 static bool initialize_shared_audio(void)

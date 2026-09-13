@@ -695,8 +695,9 @@ static esp_err_t do_ota_checkin(void)
 
     esp_http_client_close(client);
 
-    ESP_LOGI(TAG, "Check-in HTTP %d, content-length %lld, read %d bytes",
-             status, (long long)content_len, total);
+    /* Nano printf has no %lld; the reply is capped at a few KB anyway. */
+    ESP_LOGI(TAG, "Check-in HTTP %d, content-length %d, read %d bytes",
+             status, (int)content_len, total);
 
     if (resp == NULL)
     {
