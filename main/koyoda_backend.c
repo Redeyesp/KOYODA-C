@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -87,9 +88,21 @@ static const char *TAG = "KOYODA_BACKEND";
  */
 #define BACKEND_TASK_PRIORITY     2
 #define BACKEND_TASK_CORE         1
-/* The OTA check-in performs a full HTTPS request on this task, and
- * mbedtls needs several KB of stack for the handshake alone. */
-#define BACKEND_TASK_STACK_BYTES  10240
+/*
+ * This task runs, at different moments: an HTTPS check-in (mbedtls
+ * handshake), the Opus encoder, the Opus decoder and two resamplers.
+ *
+ * Reference point: xiaozhi-esp32 gives its dedicated opus_codec task
+ * 2048*12 = 24576 bytes for the codec work ALONE, on a separate task from
+ * its networking. KOYODA does both on this one task, so 10240 was far too
+ * small and FreeRTOS caught it as
+ *   "***ERROR*** A stack overflow in task koyoda_backend has been detected."
+ * the first time a frame was actually encoded.
+ *
+ * The watermark is logged at runtime (see backend_task) so this number
+ * can be tuned against real measurements instead of guesswork.
+ */
+#define BACKEND_TASK_STACK_BYTES  (2048 * 14)
 
 typedef struct
 {
@@ -162,6 +175,7 @@ static QueueHandle_t s_pkt_queue = NULL;
 static uint8_t *s_pkt_queue_storage = NULL;
 static StaticQueue_t s_pkt_queue_struct;
 static volatile uint32_t s_pkt_dropped = 0;
+static size_t s_stack_low_reported = SIZE_MAX;
 static uint8_t *s_mic_queue_storage = NULL;
 static StaticQueue_t s_mic_queue_struct;
 static TaskHandle_t s_task = NULL;
@@ -1024,6 +1038,13 @@ static esp_err_t open_ws_channel(void)
 
     s_channel_open = true;
     koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
+
+    /* Real measurement, not a guess: how much of this task's stack has
+     * ever been unused. If this gets close to zero, raise
+     * BACKEND_TASK_STACK_BYTES. */
+    ESP_LOGI(TAG, "backend task stack: %u bytes still free (of %u)",
+             (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)),
+             (unsigned)BACKEND_TASK_STACK_BYTES);
     return ESP_OK;
 }
 
@@ -1394,6 +1415,20 @@ static void backend_task(void *arg)
          * are not delayed by a whole idle tick; idle slowly otherwise. */
         vTaskDelay(pdMS_TO_TICKS(s_channel_open ? BACKEND_ACTIVE_TICK_MS
                                                 : BACKEND_TICK_MS));
+
+        /* Report the worst-case stack usage once encoding has really run;
+         * the peak happens inside the Opus encoder, not at channel open. */
+        if (s_channel_open)
+        {
+            size_t free_bytes =
+                uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+            if (free_bytes < s_stack_low_reported)
+            {
+                s_stack_low_reported = free_bytes;
+                ESP_LOGI(TAG, "backend stack low-water: %u bytes free",
+                         (unsigned)free_bytes);
+            }
+        }
     }
 }
 
