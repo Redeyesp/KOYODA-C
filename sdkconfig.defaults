@@ -31,7 +31,28 @@ CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=2
 CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+
+# Internal RAM reserved exclusively for DMA-capable allocations. The LCD
+# takes its flush buffers from this pool, so when it runs dry the symptom
+# is "setup_dma_priv_buffer: Failed to allocate priv TX buffer" and a
+# frozen or ghosting face while swiping pages.
+# 64 KB was enough before the xiaozhi backend linked in TLS, the websocket
+# client and the Opus codec; 96 KB is what xiaozhi-esp32 itself reserves
+# on the ESP32-S3.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304
+
+# Wi-Fi buffers also live in internal RAM. These are xiaozhi-esp32's
+# ESP32-S3 values and free several KB without hurting a device that only
+# streams audio.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_RX_BA_WIN=3
+CONFIG_ESP_WIFI_DYNAMIC_RX_MGMT_BUFFER=y
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+
+# Smaller printf implementation; recovers a few KB of RAM and flash.
+CONFIG_NEWLIB_NANO_FORMAT=y
 
 # Keep LCD SPI queue shallow so PSRAM-backed LVGL flushes do not exhaust
 # temporary DMA-capable internal buffers when Wi-Fi/APSTA is active.
