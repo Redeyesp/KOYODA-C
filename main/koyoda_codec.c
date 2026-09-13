@@ -13,6 +13,10 @@
 
 static const char *TAG = "KOYODA_CODEC";
 
+#ifndef CONFIG_KOYODA_MIC_DIGITAL_GAIN_X10
+#define CONFIG_KOYODA_MIC_DIGITAL_GAIN_X10 10   /* 1.0x = off */
+#endif
+
 /* Accumulator must hold at least one full Opus frame plus one resampled
  * input block of slack before it is drained. */
 /* Accumulator capacity is computed at open() from the encoder-reported
@@ -45,6 +49,7 @@ static size_t s_enc_frame_samples = KOYODA_OPUS_FRAME_SAMPLES;
 static int16_t *s_dec_pcm16k = NULL;  /* decoder output before resampling */
 
 static bool s_open = false;
+static uint32_t s_clip_run = 0;
 
 static void free_all(void)
 {
@@ -289,6 +294,48 @@ esp_err_t koyoda_codec_encode_push(
     {
         return ESP_FAIL;
     }
+
+    /*
+     * Optional digital make-up gain, applied in place on the resampled
+     * block. This deliberately sits AFTER the mic path has already been
+     * captured, so VAD, the local beep and playback all still see the
+     * original levels -- only the audio sent to the server is boosted.
+     *
+     * Digital gain adds no new information, so raise the ES7210 analog
+     * gain first (CONFIG_KOYODA_MIC_ANALOG_GAIN_DB) and use this only to
+     * close the last bit of the gap. Saturating, never wrapping: a wrap
+     * would turn a loud syllable into a burst of noise.
+     */
+#if CONFIG_KOYODA_MIC_DIGITAL_GAIN_X10 != 10
+    {
+        const int32_t g = CONFIG_KOYODA_MIC_DIGITAL_GAIN_X10;
+        uint32_t clipped = 0;
+        for (uint32_t i = 0; i < produced; i++)
+        {
+            int32_t v = ((int32_t)s_resamp_scratch[i] * g) / 10;
+            if (v > 32767)
+            {
+                v = 32767;
+                clipped++;
+            }
+            else if (v < -32768)
+            {
+                v = -32768;
+                clipped++;
+            }
+            s_resamp_scratch[i] = (int16_t)v;
+        }
+
+        /* Occasional clipping on peaks is fine; constant clipping means the
+         * gain is too high and speech will sound distorted to the server. */
+        s_clip_run = clipped ? (s_clip_run + clipped) : 0;
+        if (s_clip_run > 2000)
+        {
+            ESP_LOGW(TAG, "Mic digital gain is clipping steadily; lower it");
+            s_clip_run = 0;
+        }
+    }
+#endif
 
     /* 2. Accumulate and emit whole 60 ms frames. */
     size_t consumed = 0;

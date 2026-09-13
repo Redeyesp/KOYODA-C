@@ -46,7 +46,19 @@ static const char *TAG = "KOYODA_AUDIO";
 #define AUDIO_CHANNELS                     1
 
 #define MIC_SAMPLES_PER_READ             256
-#define MIC_GAIN_DB                     24.0f
+/*
+ * ES7210 analog input gain, applied before the ADC. Raising this is the
+ * highest-quality way to fix a quiet microphone, because it adds real
+ * signal rather than amplifying what was already quantised.
+ *
+ * Measured at the original 24 dB, normal speech peaked around 3% of full
+ * scale, roughly 5-10x lower than the 15-30% that speech recognition
+ * expects. The chip accepts up to 37.5 dB.
+ *
+ * This is the ONLY line changed in this file for the xiaozhi work; the
+ * audio pipeline itself is untouched.
+ */
+#define MIC_GAIN_DB                     ((float)CONFIG_KOYODA_MIC_ANALOG_GAIN_DB)
 #define MIC_REPORT_MS                    1000
 
 #define DEFAULT_VOLUME_PERCENT             90

@@ -101,3 +101,38 @@ config KOYODA_DRAW_BUFFER_LINES
         but takes more internal RAM away from the codec.
 
 endmenu
+
+menu "KOYODA Microphone"
+
+config KOYODA_MIC_ANALOG_GAIN_DB
+    int "ES7210 analog input gain (dB)"
+    range 0 37
+    default 33
+    help
+        Gain applied inside the microphone codec, before the ADC. This is
+        the best place to fix a quiet mic because it captures more real
+        signal instead of amplifying quantisation noise.
+
+        At the original 24 dB, normal speech peaked near 3% of full scale;
+        speech recognition works best around 15-30%. 33 dB is a safe step
+        up that leaves headroom; 37 is the chip maximum.
+
+        Watch the "MIC ... peak=" line in the serial log while talking
+        normally and tune so peaks land in the low thousands. If the noise
+        floor (shown as "noise=") climbs above ~80, back this off.
+
+config KOYODA_MIC_DIGITAL_GAIN_X10
+    int "Extra digital gain for the AI stream (x10)"
+    range 10 80
+    default 20
+    help
+        Multiplier applied only to the audio sent to the server, in tenths:
+        10 = 1.0x (off), 20 = 2.0x, 35 = 3.5x.
+
+        This does NOT affect VAD, the local beep or playback, so it cannot
+        change how the pet behaves offline. It adds no new information, so
+        raise the analog gain above first and use this for the remainder.
+
+        A warning is logged if it clips continuously.
+
+endmenu
