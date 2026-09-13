@@ -44,7 +44,17 @@ behaviour off completely:
 | `KOYODA_MIC_ANALOG_GAIN_DB` | **24** | identical to the old hard-coded `24.0f` |
 | `KOYODA_MIC_DIGITAL_GAIN_X10` | **10** | the whole gain block is removed by the preprocessor |
 
-`idf.py menuconfig` → **KOYODA Microphone** → set 24 and 10 → rebuild.
+**Edit `sdkconfig.defaults`, not menuconfig.** CI runs `idf.py set-target`,
+which regenerates `sdkconfig` from `sdkconfig.defaults` on every build, and
+`sdkconfig` is gitignored - so a local menuconfig change never reaches the
+firmware CI produces.
+
+```
+CONFIG_KOYODA_MIC_ANALOG_GAIN_DB=24
+CONFIG_KOYODA_MIC_DIGITAL_GAIN_X10=10
+```
+
+menuconfig only works if you build locally with `idf.py build`.
 
 This is verified, not assumed: at `10` the preprocessor emits zero lines of
 the gain code, so the binary behaves exactly as it did before.

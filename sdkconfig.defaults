@@ -52,7 +52,19 @@ CONFIG_ESP_WIFI_IRAM_OPT=n
 CONFIG_ESP_WIFI_RX_IRAM_OPT=n
 
 # Smaller printf implementation; recovers a few KB of RAM and flash.
+# NOTE: nano printf has no %lld / %llu. Use %lu or %d in log strings.
 CONFIG_NEWLIB_NANO_FORMAT=y
+
+# --- Microphone gain ---
+# These MUST live here, not in menuconfig: CI runs `idf.py set-target`,
+# which regenerates sdkconfig from this file on every build, and sdkconfig
+# is gitignored. A local menuconfig change is silently discarded by CI.
+#
+# 36 rather than 33 because the ES7210 quantises to 3 dB steps: 33 was
+# rounded down to 30, which is why the measured gain was 2.0x instead of
+# the expected 2.8x.
+CONFIG_KOYODA_MIC_ANALOG_GAIN_DB=36
+CONFIG_KOYODA_MIC_DIGITAL_GAIN_X10=20
 
 # Keep LCD SPI queue shallow so PSRAM-backed LVGL flushes do not exhaust
 # temporary DMA-capable internal buffers when Wi-Fi/APSTA is active.
