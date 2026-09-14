@@ -11,19 +11,18 @@ static const char *TAG = "KOYODA_VAD";
 #define VAD_NVS_KEY       "preset"
 
 /*
- * NORMAL is first in intent even though it is second in the enum: it holds
- * the exact constants koyoda_audio_duplex.c shipped with, so a device that
- * has never been configured behaves identically to every earlier build.
+ * BUSY holds the exact constants koyoda_audio_duplex.c originally shipped
+ * with, so selecting it reproduces every earlier build precisely.
  */
 static const koyoda_vad_params_t k_presets[KOYODA_VAD_PRESET_COUNT] = {
-    [KOYODA_VAD_PRESET_SENSITIVE] = {
+    [KOYODA_VAD_PRESET_QUIET] = {
         .start_frames     = 2,
         .end_silence_ms   = 1200,
         .min_start_level  = 50U,
         .noise_multiplier = 2U,
         .noise_margin     = 20U,
     },
-    [KOYODA_VAD_PRESET_NORMAL] = {
+    [KOYODA_VAD_PRESET_BUSY] = {
         /* Original values. Do not change: this is the baseline every
          * earlier measurement was taken against. */
         .start_frames     = 3,
@@ -33,26 +32,44 @@ static const koyoda_vad_params_t k_presets[KOYODA_VAD_PRESET_COUNT] = {
         .noise_margin     = 30U,
     },
     [KOYODA_VAD_PRESET_OUTDOOR] = {
+        /*
+         * Measured fix. The first attempt used 5x + 80 with a floor of
+         * 180, which produced a runaway: the threshold rose above normal
+         * speech level, so speech was classified as idle, and the noise
+         * floor -- which only updates while idle -- absorbed the speech
+         * and climbed to 233. The threshold then hit 1245 and KOYODA went
+         * deaf for about four seconds after every reply.
+         *
+         * Speech measured a median avg of ~201 and a minimum of ~63, so
+         * the threshold has to stay well under that. These values give
+         * 128 in a home room and 240 in a noisy one: still far stricter
+         * than BUSY, without crossing into the feedback loop.
+         */
         .start_frames     = 4,
         .end_silence_ms   = 700,
-        .min_start_level  = 180U,
-        .noise_multiplier = 5U,
-        .noise_margin     = 80U,
+        .min_start_level  = 120U,
+        .noise_multiplier = 4U,
+        .noise_margin     = 40U,
     },
 };
 
 static const char *k_names[KOYODA_VAD_PRESET_COUNT] = {
-    "SENSITIVE", "NORMAL", "OUTDOOR"
+    "QUIET", "BUSY", "OUTDOOR"
 };
 
 static const char *k_hints[KOYODA_VAD_PRESET_COUNT] = {
-    "Quiet room, soft or slow speech",
-    "Everyday use (tested default)",
-    "Crowds, traffic, noisy places",
+    "Alone in a quiet room",
+    "People or noise around",
+    "Outside, traffic, crowds",
 };
 
 /* Starts as NORMAL so that even if init() is never reached, the audio task
  * finds the original values rather than zeros. */
+/*
+ * Starts as BUSY -- the original constants -- so that if init() is never
+ * reached the audio task still finds sane values. init() then applies the
+ * real default, QUIET.
+ */
 koyoda_vad_params_t g_koyoda_vad = {
     .start_frames     = 3,
     .end_silence_ms   = 850,
@@ -61,7 +78,7 @@ koyoda_vad_params_t g_koyoda_vad = {
     .noise_margin     = 30U,
 };
 
-static koyoda_vad_preset_t s_current = KOYODA_VAD_PRESET_NORMAL;
+static koyoda_vad_preset_t s_current = KOYODA_VAD_PRESET_BUSY;
 
 static void apply_locked(koyoda_vad_preset_t preset)
 {
@@ -87,12 +104,15 @@ static void apply_locked(koyoda_vad_preset_t preset)
 
 void koyoda_vad_preset_init(void)
 {
-    koyoda_vad_preset_t preset = KOYODA_VAD_PRESET_NORMAL;
+    /* QUIET is the shipped default: a single user in a room is the normal
+     * case for KOYODA, and it keeps whole sentences together. Tap BUSY on
+     * the MIC page to get the original behaviour back. */
+    koyoda_vad_preset_t preset = KOYODA_VAD_PRESET_QUIET;
 
     nvs_handle_t handle;
     if (nvs_open(VAD_NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK)
     {
-        uint8_t stored = (uint8_t)KOYODA_VAD_PRESET_NORMAL;
+        uint8_t stored = (uint8_t)KOYODA_VAD_PRESET_QUIET;
         if (nvs_get_u8(handle, VAD_NVS_KEY, &stored) == ESP_OK &&
             stored < (uint8_t)KOYODA_VAD_PRESET_COUNT)
         {

@@ -41,10 +41,20 @@ extern "C" {
  * to the audio path.
  */
 
+/*
+ * Named after the SITUATION the user is in, not after how sensitive the
+ * detector is. "Normal" stopped being meaningful once QUIET became the
+ * default, and a person can tell you which room they are in far more
+ * reliably than which sensitivity they want.
+ *
+ * The numeric order is deliberately unchanged (0/1/2) so a device that
+ * already stored a choice in NVS keeps the same settings after this
+ * rename.
+ */
 typedef enum
 {
-    KOYODA_VAD_PRESET_SENSITIVE = 0,
-    KOYODA_VAD_PRESET_NORMAL,
+    KOYODA_VAD_PRESET_QUIET = 0,   /* was SENSITIVE */
+    KOYODA_VAD_PRESET_BUSY,        /* was NORMAL    */
     KOYODA_VAD_PRESET_OUTDOOR,
     KOYODA_VAD_PRESET_COUNT
 } koyoda_vad_preset_t;
@@ -76,7 +86,7 @@ koyoda_vad_preset_t koyoda_vad_preset_get(void);
 /* Apply a preset and persist it. Safe to call from the UI task. */
 void koyoda_vad_preset_set(koyoda_vad_preset_t preset);
 
-/* "SENSITIVE" / "NORMAL" / "OUTDOOR" */
+/* "QUIET" / "BUSY" / "OUTDOOR" */
 const char *koyoda_vad_preset_name(koyoda_vad_preset_t preset);
 
 /* One short line for the UI, e.g. "Quiet room, soft speech". */

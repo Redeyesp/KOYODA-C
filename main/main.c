@@ -1098,22 +1098,22 @@ static void mic_apply_preset(koyoda_vad_preset_t preset)
  * lv_event_get_code(), which is the one event accessor already proven in
  * this project; lv_event_get_user_data() is not used anywhere else here.
  */
-static void mic_sensitive_button_cb(lv_event_t *e)
+static void mic_quiet_button_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
     {
         return;
     }
-    mic_apply_preset(KOYODA_VAD_PRESET_SENSITIVE);
+    mic_apply_preset(KOYODA_VAD_PRESET_QUIET);
 }
 
-static void mic_normal_button_cb(lv_event_t *e)
+static void mic_busy_button_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
     {
         return;
     }
-    mic_apply_preset(KOYODA_VAD_PRESET_NORMAL);
+    mic_apply_preset(KOYODA_VAD_PRESET_BUSY);
 }
 
 static void mic_outdoor_button_cb(lv_event_t *e)
@@ -1152,15 +1152,14 @@ static void create_mic_page(lv_obj_t *screen)
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 72);
 
     /*
-     * Three stacked buttons. Vertical rather than side-by-side because on a
-     * 466 px circle three horizontal buttons would each be too narrow for
-     * the word "SENSITIVE" at this font size.
+     * Three stacked buttons, named after the situation rather than the
+     * sensitivity level: a person knows which room they are in.
      */
     static const char *labels[KOYODA_VAD_PRESET_COUNT] = {
-        "SENSITIVE", "NORMAL", "OUTDOOR"
+        "QUIET", "BUSY", "OUTDOOR"
     };
     static const lv_event_cb_t callbacks[KOYODA_VAD_PRESET_COUNT] = {
-        mic_sensitive_button_cb, mic_normal_button_cb, mic_outdoor_button_cb
+        mic_quiet_button_cb, mic_busy_button_cb, mic_outdoor_button_cb
     };
     const int y_offsets[KOYODA_VAD_PRESET_COUNT] = { -70, 0, 70 };
 
