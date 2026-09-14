@@ -189,6 +189,10 @@ static EventGroupHandle_t s_events = NULL;
 
 static volatile bool s_channel_open = false;
 static volatile bool s_playback_active = false;
+/* Between "tts start" and "tts stop". Playback hardware is only opened
+ * once audio actually arrives, so a reply that carries no audio never
+ * flashes the SPEAKING face. */
+static volatile bool s_tts_session = false;
 static volatile bool s_prev_vad = false;
 
 /* Scratch for decoded playback PCM. Only the websocket event task writes
@@ -789,6 +793,34 @@ static void send_listen_state(const char *state, const char *mode)
     cJSON_Delete(root);
 }
 
+/*
+ * True if a transcript contains actual words. Any byte with the high bit
+ * set starts a UTF-8 multi-byte sequence, which covers Thai and Japanese,
+ * so this cannot accidentally discard non-Latin speech. ASCII letters and
+ * digits count; whitespace and lone punctuation do not.
+ */
+static bool stt_text_is_meaningful(const char *text)
+{
+    if (text == NULL)
+    {
+        return false;
+    }
+    for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; p++)
+    {
+        if (*p >= 0x80)
+        {
+            return true;
+        }
+        if ((*p >= 'a' && *p <= 'z') ||
+            (*p >= 'A' && *p <= 'Z') ||
+            (*p >= '0' && *p <= '9'))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void handle_incoming_json(const char *data, int len)
 {
     cJSON *root = cJSON_ParseWithLength(data, (size_t)len);
@@ -832,14 +864,26 @@ static void handle_incoming_json(const char *data, int len)
         else if (strcmp(type->valuestring, "stt") == 0)
         {
             cJSON *text = cJSON_GetObjectItem(root, "text");
-            if (cJSON_IsString(text))
+            const char *t = cJSON_IsString(text) ? text->valuestring : NULL;
+
+            /*
+             * The server sometimes emits a transcript that is empty or just
+             * a lone "." as it finalises a segment. Treating those as real
+             * speech pushed the face through THINKING -> SPEAKING for a
+             * fraction of a second, which reads as a flicker.
+             */
+            if (stt_text_is_meaningful(t))
             {
-                ESP_LOGI(TAG, "STT: %s", text->valuestring);
+                ESP_LOGI(TAG, "STT: %s", t);
+                backend_ctrl_t ev = BE_CTRL_STT_TEXT;
+                if (s_ctrl_queue != NULL)
+                {
+                    xQueueSend(s_ctrl_queue, &ev, 0);
+                }
             }
-            backend_ctrl_t ev = BE_CTRL_STT_TEXT;
-            if (s_ctrl_queue != NULL)
+            else
             {
-                xQueueSend(s_ctrl_queue, &ev, 0);
+                ESP_LOGD(TAG, "Ignoring empty transcript");
             }
         }
     }
@@ -890,7 +934,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
              * Protocol version 1: the payload is a bare Opus packet.
              * Copy and hand off; decoding here would overflow this task.
              */
-            if (s_playback_active && s_pkt_queue != NULL &&
+            if (s_tts_session && s_pkt_queue != NULL &&
                 data->data_len <= BACKEND_PKT_MAX_BYTES)
             {
                 audio_pkt_msg_t pkt;
@@ -1068,6 +1112,7 @@ static void close_ws_channel(void)
         s_ws = NULL;
     }
     s_channel_open = false;
+    s_tts_session = false;
 
     /* Runs on the worker task, so taking the audio lock here is safe. */
     if (s_playback_active)
@@ -1375,21 +1420,22 @@ static void backend_task(void *arg)
                 break;
 
             case BE_CTRL_TTS_START:
-                if (!s_playback_active &&
-                    koyoda_audio_duplex_playback_start() == ESP_OK)
-                {
-                    s_playback_active = true;
-                    koyoda_face_state_set(KOYODA_FACE_AI_SPEAKING);
-                }
+                /* Arm only. The speaker is opened on the first decoded
+                 * packet, so a zero-audio reply cannot produce a
+                 * "samples=0" playback burst and a face flicker. */
+                s_tts_session = true;
                 break;
 
             case BE_CTRL_TTS_STOP:
+                s_tts_session = false;
                 if (s_playback_active)
                 {
                     koyoda_audio_duplex_playback_end();
                     s_playback_active = false;
+                    koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
                 }
-                koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
+                /* If playback never started there was no audio at all, so
+                 * the face was never switched and needs no reset. */
                 break;
 
             case BE_CTRL_STT_TEXT:
@@ -1407,10 +1453,21 @@ static void backend_task(void *arg)
             audio_pkt_msg_t pkt;
             while (xQueueReceive(s_pkt_queue, &pkt, 0) == pdTRUE)
             {
-                if (!s_playback_active || !koyoda_codec_is_open())
+                if (!s_tts_session || !koyoda_codec_is_open())
                 {
                     continue;
                 }
+
+                if (!s_playback_active)
+                {
+                    if (koyoda_audio_duplex_playback_start() != ESP_OK)
+                    {
+                        continue;
+                    }
+                    s_playback_active = true;
+                    koyoda_face_state_set(KOYODA_FACE_AI_SPEAKING);
+                }
+
                 size_t pcm_samples = 0;
                 if (koyoda_codec_decode(pkt.data, pkt.len,
                                         s_playback_pcm,
