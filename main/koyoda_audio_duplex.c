@@ -101,16 +101,14 @@ typedef struct
  * The noise floor adapts only while idle, so normal room noise does not
  * continually lift the threshold during speech.
  * ========================================================= */
-#define VAD_START_CONSECUTIVE_FRAMES         3
-#define VAD_END_SILENCE_MS                 850
+/*
+ * VAD tuning constants now come from koyoda_vad_preset.h so a preset can
+ * be chosen in sdkconfig.defaults without editing this file. The NORMAL
+ * preset reproduces the original values exactly.
+ */
+#include "koyoda_vad_preset.h"
+
 #define VAD_POST_BEEP_IGNORE_MS            250
-
-/* Absolute safety floor for a quiet room. */
-#define VAD_MIN_START_LEVEL                  70U
-
-/* Adaptive threshold = noise_floor * 3 + margin. */
-#define VAD_NOISE_MULTIPLIER                  3U
-#define VAD_NOISE_MARGIN                     30U
 
 /* Noise-floor IIR: 31/32 old + 1/32 new. */
 #define VAD_NOISE_FILTER_SHIFT                5U
