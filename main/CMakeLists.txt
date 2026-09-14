@@ -10,6 +10,7 @@ idf_component_register(
          "koyoda_backend.c"
          "koyoda_codec.c"
          "koyoda_codec_test.c"
+         "koyoda_vad_preset.c"
          "koyoda_face_state.c"
          "koyoda_ai_overlays.c"
          "koyoda_charge_composite.c"

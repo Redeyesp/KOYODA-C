@@ -119,7 +119,7 @@ git push
 | `KOYODA_MIC_ANALOG_GAIN_DB` | **33** (24 = original) | rounds to 30 on the 3 dB grid. 36 was tried and measured WORSE: SNR fell from 17.1 to 14.7 dB because the mic's own noise scales with gain. Judge changes by SNR (speech avg / noise floor), not by peak level |
 | `KOYODA_MIC_DIGITAL_GAIN_X10` | **20** (10 = off) | at 10 the code is removed by the preprocessor |
 | `NEWLIB_NANO_FORMAT` | **y** | saves RAM but has no `%lld`/`%llu`; use `%lu`/`%d` |
-| `KOYODA_VAD_NORMAL` | **y** | NORMAL reproduces the original VAD constants exactly (3 / 850 ms / 70 / x3 / +30). Selecting another preset only affects behaviour while AI mode is ON - VAD is skipped entirely when AI is off, so the pet cannot be harmed by it |
+| Mic sensitivity preset | **NORMAL** | Now chosen on the MIC page at runtime and stored in NVS, not in sdkconfig. NORMAL reproduces the original VAD constants exactly (3 / 850 ms / 70 / x3 / +30). It only affects behaviour while AI mode is ON - VAD is skipped entirely when AI is off, so the pet cannot be harmed by it. To undo: open the MIC page and tap NORMAL, no rebuild needed |
 
 ---
 

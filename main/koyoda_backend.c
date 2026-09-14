@@ -35,7 +35,6 @@
 #include "koyoda_audio_duplex.h"
 #include "koyoda_face_state.h"
 #include "koyoda_codec.h"
-#include "koyoda_vad_preset.h"
 #include "koyoda_codec_test.h"
 
 static const char *TAG = "KOYODA_BACKEND";
@@ -1611,12 +1610,6 @@ esp_err_t koyoda_backend_start(void)
     }
 
     ESP_LOGI(TAG, "Xiaozhi backend foundation ready; OTA URL=%s", CONFIG_KOYODA_OTA_URL);
-    /* Print the VAD preset here rather than in the audio module, to keep
-     * that file untouched. */
-    ESP_LOGI(TAG, "VAD preset: %s (end silence %d ms, threshold = noise*%u + %u, floor %u)",
-             KOYODA_VAD_PRESET_NAME, VAD_END_SILENCE_MS,
-             (unsigned)VAD_NOISE_MULTIPLIER, (unsigned)VAD_NOISE_MARGIN,
-             (unsigned)VAD_MIN_START_LEVEL);
     ESP_LOGI(TAG,
              "heap at boot: internal %u B free (largest DMA block %u B), psram %u B",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),

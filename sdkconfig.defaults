@@ -98,11 +98,3 @@ CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
 CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
 CONFIG_MBEDTLS_SSL_RENEGOTIATION=n
 
-# --- Voice detection preset ---
-# Sensitive / Normal / Outdoor. NORMAL reproduces the original values
-# exactly, so this default changes nothing. Swap the commented lines to
-# try another preset; like the mic gain this must live here because CI
-# regenerates sdkconfig from this file on every build.
-CONFIG_KOYODA_VAD_NORMAL=y
-# CONFIG_KOYODA_VAD_SENSITIVE=y
-# CONFIG_KOYODA_VAD_OUTDOOR=y

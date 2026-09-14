@@ -23,6 +23,7 @@
 #include "koyoda_ai_overlays.h"
 #include "koyoda_charge_composite.h"
 #include "koyoda_listening_notice.h"
+#include "koyoda_vad_preset.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
 LV_IMAGE_DECLARE(koyoda_sleep_1);
@@ -51,6 +52,9 @@ static lv_obj_t *wifi_change_button_label = NULL;
 static lv_obj_t *wifi_signal_bars[4] = {NULL, NULL, NULL, NULL};
 
 static lv_obj_t *volume_page = NULL;
+static lv_obj_t *mic_page = NULL;
+static lv_obj_t *mic_hint_label = NULL;
+static lv_obj_t *mic_buttons[KOYODA_VAD_PRESET_COUNT] = {NULL, NULL, NULL};
 static lv_obj_t *volume_percent_label = NULL;
 static lv_obj_t *volume_status_label = NULL;
 
@@ -108,10 +112,11 @@ typedef enum
     PAGE_BATTERY,
     PAGE_WIFI,
     PAGE_VOLUME,
+    PAGE_MIC,
     PAGE_COUNT
 } koyoda_page_t;
 
-#define KOYODA_ENABLED_PAGE_COUNT 4
+#define KOYODA_ENABLED_PAGE_COUNT 5
 #define KOYODA_SWIPE_THRESHOLD_PX 70
 
 static volatile koyoda_page_t current_page = PAGE_FACE;
@@ -1045,6 +1050,133 @@ static void create_volume_page(lv_obj_t *screen)
     lv_obj_add_flag(volume_page, LV_OBJ_FLAG_HIDDEN);
 }
 
+
+/* ================= MIC sensitivity page ================= */
+
+static void update_mic_ui_locked(void)
+{
+    if (mic_page == NULL)
+    {
+        return;
+    }
+
+    const koyoda_vad_preset_t active = koyoda_vad_preset_get();
+
+    for (int i = 0; i < KOYODA_VAD_PRESET_COUNT; ++i)
+    {
+        if (mic_buttons[i] == NULL)
+        {
+            continue;
+        }
+        const bool selected = (i == (int)active);
+        lv_obj_set_style_bg_color(
+            mic_buttons[i],
+            selected ? lv_color_hex(0x00D5D5) : lv_color_hex(0x222222),
+            0);
+        lv_obj_set_style_border_color(
+            mic_buttons[i],
+            selected ? lv_color_hex(0x00D5D5) : lv_color_hex(0x555555),
+            0);
+    }
+
+    if (mic_hint_label != NULL)
+    {
+        lv_label_set_text(mic_hint_label, koyoda_vad_preset_hint(active));
+    }
+}
+
+static void mic_preset_button_cb(lv_event_t *e)
+{
+    /* The preset index travels as user data, so all three buttons share
+     * one callback instead of three near-identical ones. */
+    const int index = (int)(intptr_t)lv_event_get_user_data(e);
+
+    koyoda_vad_preset_set((koyoda_vad_preset_t)index);
+    update_mic_ui_locked();
+
+    ESP_LOGI(TAG, "Mic sensitivity -> %s",
+             koyoda_vad_preset_name((koyoda_vad_preset_t)index));
+}
+
+static void create_mic_page(lv_obj_t *screen)
+{
+    mic_page = lv_obj_create(screen);
+    lv_obj_set_size(mic_page, 466, 466);
+    lv_obj_center(mic_page);
+    lv_obj_set_style_bg_color(mic_page, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(mic_page, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(mic_page, 0, 0);
+    lv_obj_set_style_pad_all(mic_page, 0, 0);
+    lv_obj_set_style_radius(mic_page, 0, 0);
+    lv_obj_clear_flag(mic_page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(mic_page, LV_OBJ_FLAG_CLICKABLE);
+
+    /* Same whole-page rotation the other pages use for this panel. */
+    lv_obj_set_style_transform_pivot_x(mic_page, 233, 0);
+    lv_obj_set_style_transform_pivot_y(mic_page, 233, 0);
+    lv_obj_set_style_transform_rotation(mic_page, 900, 0);
+
+    lv_obj_t *title = lv_label_create(mic_page);
+    lv_label_set_text(title, "MIC");
+    lv_obj_set_style_text_color(title, lv_color_hex(0x00D5D5), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 72);
+
+    /*
+     * Three stacked buttons. Vertical rather than side-by-side because on a
+     * 466 px circle three horizontal buttons would each be too narrow for
+     * the word "SENSITIVE" at this font size.
+     */
+    static const char *labels[KOYODA_VAD_PRESET_COUNT] = {
+        "SENSITIVE", "NORMAL", "OUTDOOR"
+    };
+    const int y_offsets[KOYODA_VAD_PRESET_COUNT] = { -70, 0, 70 };
+
+    for (int i = 0; i < KOYODA_VAD_PRESET_COUNT; ++i)
+    {
+        lv_obj_t *button = lv_button_create(mic_page);
+        lv_obj_set_size(button, 230, 54);
+        lv_obj_align(button, LV_ALIGN_CENTER, 0, y_offsets[i]);
+        lv_obj_set_style_radius(button, 20, 0);
+        lv_obj_set_style_border_width(button, 2, 0);
+
+        /* Let a swipe that begins on a button still change page. */
+        lv_obj_add_flag(button, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+        lv_obj_add_event_cb(
+            button,
+            mic_preset_button_cb,
+            LV_EVENT_CLICKED,
+            (void *)(intptr_t)i);
+
+        lv_obj_t *label = lv_label_create(button);
+        lv_label_set_text(label, labels[i]);
+        lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+        lv_obj_center(label);
+
+        mic_buttons[i] = button;
+    }
+
+    mic_hint_label = lv_label_create(mic_page);
+    lv_label_set_text(mic_hint_label, "");
+    lv_obj_set_style_text_color(mic_hint_label, lv_color_hex(0xBBBBBB), 0);
+    lv_obj_set_style_text_font(mic_hint_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_width(mic_hint_label, 330);
+    lv_obj_set_style_text_align(mic_hint_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(mic_hint_label, LV_ALIGN_CENTER, 0, 140);
+
+    /* This page sits above the swipe layer when visible, so it must own
+     * swipe input itself, exactly like the Volume page. */
+    lv_obj_add_event_cb(mic_page, swipe_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(mic_page, swipe_event_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(mic_page, swipe_event_cb, LV_EVENT_PRESS_LOST, NULL);
+
+    update_mic_ui_locked();
+
+    lv_obj_add_flag(mic_page, LV_OBJ_FLAG_HIDDEN);
+}
+
 /* Called only from an LVGL event callback, so do not take the BSP LVGL lock here. */
 static void set_page_from_lvgl(koyoda_page_t page)
 {
@@ -1074,6 +1206,7 @@ static void set_page_from_lvgl(koyoda_page_t page)
     lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(wifi_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(volume_page, LV_OBJ_FLAG_HIDDEN);
+    if (mic_page) lv_obj_add_flag(mic_page, LV_OBJ_FLAG_HIDDEN);
 
     if (page == PAGE_FACE)
     {
@@ -1113,6 +1246,18 @@ static void set_page_from_lvgl(koyoda_page_t page)
         lv_obj_invalidate(lv_screen_active());
 
         ESP_LOGI(TAG, "Page -> VOLUME");
+        return;
+    }
+    else if (page == PAGE_MIC)
+    {
+        lv_obj_clear_flag(mic_page, LV_OBJ_FLAG_HIDDEN);
+        update_mic_ui_locked();
+
+        /* Needs to be above the swipe layer so its buttons receive touch. */
+        lv_obj_move_foreground(mic_page);
+        lv_obj_invalidate(lv_screen_active());
+
+        ESP_LOGI(TAG, "Page -> MIC");
         return;
     }
 
@@ -1983,17 +2128,22 @@ void app_main(void)
         ESP_LOGW(TAG, "Listening notice overlay creation failed");
     }
 
+    /* Restore the saved mic sensitivity before any page is built, so the
+     * MIC page opens already showing the active preset. */
+    koyoda_vad_preset_init();
+
     /* Charge LITE v2 has no extra LVGL object. */
 
     create_battery_page(screen);
     create_wifi_page(screen);
     create_volume_page(screen);
+    create_mic_page(screen);
     create_swipe_layer(screen);
     anim_reset(&animation, lv_tick_get());
 
     bsp_display_unlock();
 
-    ESP_LOGI(TAG, "KOYODA UI ready: Face <-> Battery <-> Wi-Fi <-> Volume");
+    ESP_LOGI(TAG, "KOYODA UI ready: Face <-> Battery <-> Wi-Fi <-> Volume <-> Mic");
     ESP_LOGI(TAG, "Listening notice v5 ready: true 3-bar double-blink on AI ON + idle");
 
     ESP_LOGI(
