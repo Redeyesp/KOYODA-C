@@ -1085,17 +1085,44 @@ static void update_mic_ui_locked(void)
     }
 }
 
-static void mic_preset_button_cb(lv_event_t *e)
+static void mic_apply_preset(koyoda_vad_preset_t preset)
 {
-    /* The preset index travels as user data, so all three buttons share
-     * one callback instead of three near-identical ones. */
-    const int index = (int)(intptr_t)lv_event_get_user_data(e);
-
-    koyoda_vad_preset_set((koyoda_vad_preset_t)index);
+    koyoda_vad_preset_set(preset);
     update_mic_ui_locked();
+    ESP_LOGI(TAG, "Mic sensitivity -> %s", koyoda_vad_preset_name(preset));
+}
 
-    ESP_LOGI(TAG, "Mic sensitivity -> %s",
-             koyoda_vad_preset_name((koyoda_vad_preset_t)index));
+/*
+ * Three separate callbacks rather than one shared callback carrying an
+ * index. This mirrors the Volume page exactly and uses only
+ * lv_event_get_code(), which is the one event accessor already proven in
+ * this project; lv_event_get_user_data() is not used anywhere else here.
+ */
+static void mic_sensitive_button_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    {
+        return;
+    }
+    mic_apply_preset(KOYODA_VAD_PRESET_SENSITIVE);
+}
+
+static void mic_normal_button_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    {
+        return;
+    }
+    mic_apply_preset(KOYODA_VAD_PRESET_NORMAL);
+}
+
+static void mic_outdoor_button_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    {
+        return;
+    }
+    mic_apply_preset(KOYODA_VAD_PRESET_OUTDOOR);
 }
 
 static void create_mic_page(lv_obj_t *screen)
@@ -1119,7 +1146,9 @@ static void create_mic_page(lv_obj_t *screen)
     lv_obj_t *title = lv_label_create(mic_page);
     lv_label_set_text(title, "MIC");
     lv_obj_set_style_text_color(title, lv_color_hex(0x00D5D5), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
+    /* Only CONFIG_LV_FONT_MONTSERRAT_14 is enabled in this project, so
+     * every page uses it; larger sizes are not compiled in. */
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 72);
 
     /*
@@ -1129,6 +1158,9 @@ static void create_mic_page(lv_obj_t *screen)
      */
     static const char *labels[KOYODA_VAD_PRESET_COUNT] = {
         "SENSITIVE", "NORMAL", "OUTDOOR"
+    };
+    static const lv_event_cb_t callbacks[KOYODA_VAD_PRESET_COUNT] = {
+        mic_sensitive_button_cb, mic_normal_button_cb, mic_outdoor_button_cb
     };
     const int y_offsets[KOYODA_VAD_PRESET_COUNT] = { -70, 0, 70 };
 
@@ -1145,9 +1177,9 @@ static void create_mic_page(lv_obj_t *screen)
 
         lv_obj_add_event_cb(
             button,
-            mic_preset_button_cb,
+            callbacks[i],
             LV_EVENT_CLICKED,
-            (void *)(intptr_t)i);
+            NULL);
 
         lv_obj_t *label = lv_label_create(button);
         lv_label_set_text(label, labels[i]);
